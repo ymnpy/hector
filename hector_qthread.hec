@@ -1,0 +1,1381 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import subprocess
+import shutil
+import time
+import psutil
+import ast
+from typing import Set, List, Dict, Optional, Tuple
+
+from pyNastran.bdf.bdf import read_bdf
+from pyNastran.op2.op2 import read_op2
+from pyNastran.bdf.mesh_utils.mass_properties import mass_properties
+
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                             QTextEdit, QProgressBar, QGroupBox, QSplitter,
+                             QFileDialog, QMessageBox, QSpinBox, QDoubleSpinBox,
+                             QComboBox, QRadioButton, QButtonGroup)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QFont
+
+import matplotlib
+matplotlib.use('Qt5Agg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
+# Optional for Gaussian optimization
+try:
+    from skopt import gp_minimize
+    from skopt.space import Real
+    SKOPT_AVAILABLE = True
+except ImportError:
+    SKOPT_AVAILABLE = False
+
+
+# Create a Worker class BEFORE the PCOMPOptimizerGUI class
+class OptimizationWorker(QThread):
+    """Worker thread for running optimization without freezing GUI"""
+    
+    # Signals to communicate with main thread
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int, int, list, object)  # iteration, max_iter, n_crit, rf_values, mass
+    status_signal = pyqtSignal(str, str)  # status text, color
+    finished_signal = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, gui_instance):
+        super().__init__()
+        self.gui = gui_instance
+        self.algorithm = None  # 'lazy' or 'gaussian'
+        
+    def run(self):
+        """This runs in separate thread"""
+        try:
+            if self.algorithm == 'lazy':
+                ok, msg = self.gui.run_lazy_optimization_thread()
+            else:
+                ok, msg = self.gui.run_gaussian_optimization_thread()
+            
+            self.finished_signal.emit(ok, msg)
+        except Exception as e:
+            import traceback
+            self.log_signal.emit(f"<span style='color:#e57373'>ERROR: {e}</span>")
+            self.log_signal.emit(f"<span style='color:#e57373'>{traceback.format_exc()}</span>")
+            self.finished_signal.emit(False, str(e))
+            
+class PCOMPOptimizerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PCOMP Thickness Optimizer v2.0")
+        self.resize(1400, 900)
+        self.apply_modern_style()
+        
+        # State variables
+        self.iteration_data = []
+        self.initial_mass = None
+        self.node_to_shells_cache = None
+        self.target_pcomp_ids = None
+        self.angle_tolerance = 30
+        self.worker = None
+        
+        # Build UI
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        splitter = QSplitter(Qt.Horizontal)
+        QHBoxLayout(main_widget).addWidget(splitter)
+        
+        splitter.addWidget(self.create_left_panel())
+        splitter.addWidget(self.create_right_panel())
+        splitter.setSizes([450, 950])
+        
+    
+    def apply_modern_style(self):
+        """Half-Life HEV Suit inspired compact theme"""
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #0a0a0a;
+                color: #d4d4d4;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 9pt;
+            }
+            QGroupBox {
+                border: 1px solid #ff6600;
+                border-radius: 3px;
+                margin-top: 8px;
+                padding-top: 8px;
+                font-weight: bold;
+                color: #ff8800;
+                font-size: 8pt;
+            }
+            QGroupBox::title { 
+                subcontrol-origin: margin; 
+                left: 8px; 
+                padding: 0 3px;
+                background-color: #0a0a0a;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background-color: #1a1a1a;
+                border: 1px solid #444444;
+                border-radius: 2px;
+                padding: 3px 5px;
+                color: #00ff00;
+                selection-background-color: #ff6600;
+                font-size: 9pt;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+                border: 1px solid #ff6600;
+                background-color: #222222;
+            }
+            QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+                background-color: #0f0f0f;
+                color: #555555;
+                border: 1px solid #2a2a2a;
+            }
+            QComboBox::drop-down { 
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow { 
+                image: none;
+                border-left: 3px solid transparent;
+                border-right: 3px solid transparent;
+                border-top: 5px solid #ff6600;
+                margin-right: 5px;
+            }
+            QPushButton {
+                background-color: #2a2a2a;
+                color: #ff8800;
+                border: 1px solid #ff6600;
+                border-radius: 2px;
+                padding: 5px 12px;
+                font-weight: bold;
+                font-size: 9pt;
+            }
+            QPushButton:hover { 
+                background-color: #3a3a3a;
+                border: 1px solid #ff8800;
+                color: #ffaa00;
+            }
+            QPushButton:pressed { 
+                background-color: #ff6600;
+                color: #000000;
+            }
+            QPushButton:disabled { 
+                background-color: #1a1a1a;
+                color: #444444;
+                border: 1px solid #2a2a2a;
+            }
+            QRadioButton { 
+                color: #d4d4d4;
+                spacing: 5px;
+                font-size: 9pt;
+            }
+            QRadioButton::indicator { 
+                width: 12px;
+                height: 12px;
+            }
+            QRadioButton::indicator::unchecked { 
+                border: 1px solid #555555;
+                border-radius: 6px;
+                background: #1a1a1a;
+            }
+            QRadioButton::indicator::checked { 
+                border: 1px solid #ff6600;
+                border-radius: 6px;
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+                    fx:0.5, fy:0.5, stop:0 #ff6600, stop:0.5 #ff8800, stop:1 #ff6600);
+            }
+            QRadioButton::indicator::checked:hover {
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,
+                    fx:0.5, fy:0.5, stop:0 #ff8800, stop:0.5 #ffaa00, stop:1 #ff8800);
+            }
+            QTextEdit {
+                background-color: #0f0f0f;
+                border: 1px solid #444444;
+                border-radius: 2px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 8pt;
+                color: #00ff00;
+                selection-background-color: #ff6600;
+            }
+            QProgressBar {
+                border: 1px solid #444444;
+                border-radius: 2px;
+                text-align: center;
+                background-color: #1a1a1a;
+                height: 18px;
+                color: #d4d4d4;
+                font-weight: bold;
+                font-size: 8pt;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff4400, stop:0.5 #ff6600, stop:1 #ff8800);
+                border-radius: 1px;
+            }
+            QLabel { 
+                color: #aaaaaa;
+                font-size: 9pt;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #1a1a1a;
+                width: 10px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #ff6600;
+                min-height: 20px;
+                border-radius: 2px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #ff8800;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                border: none;
+                background: #1a1a1a;
+                height: 10px;
+                margin: 0;
+            }
+            QScrollBar::handle:horizontal {
+                background: #ff6600;
+                min-width: 20px;
+                border-radius: 2px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #ff8800;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
+        
+    def create_left_panel(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+        
+        # FILES GROUP
+        files = QGroupBox("FILES")
+        fl = QVBoxLayout()
+        fl.setSpacing(3)
+        
+        for name, attr in [("BDF", "bdf_path"), ("OP2", "op2_path"), 
+                          ("Excel", "excel_path"), ("Nastran", "nastran_path")]:
+            hl = QHBoxLayout()
+            
+            label = QLabel(f"{name}:")
+            label.setMinimumWidth(60)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            hl.addWidget(label)
+            
+            le = QLineEdit()
+            setattr(self, attr, le)
+            if name == "Nastran":
+                le.setText(r"C:\MSC.Software\MSC_Nastran\20180\bin\nastran.exe")
+            hl.addWidget(le, 1)
+            
+            btn = QPushButton("λ")
+            btn.setMinimumWidth(30)
+            btn.setToolTip(f"Browse for {name} file")
+            btn.clicked.connect(getattr(self, f"browse_{attr.split('_')[0]}"))
+            hl.addWidget(btn)
+            
+            fl.addLayout(hl)
+        
+        files.setLayout(fl)
+        layout.addWidget(files)
+        
+        # PROPERTY SELECTION GROUP
+        prop_group = QGroupBox("PROPERTY SELECTION")
+        pg_layout = QVBoxLayout()
+        
+        self.prop_method_group = QButtonGroup()
+        
+        self.prop_neighbor_radio = QRadioButton("Neighbor Approach (auto-detect)")
+        self.prop_method_group.addButton(self.prop_neighbor_radio, 0)
+        self.prop_neighbor_radio.setChecked(True)
+        pg_layout.addWidget(self.prop_neighbor_radio)
+        
+        manual_layout = QHBoxLayout()
+        self.prop_manual_radio = QRadioButton("Manual Property IDs:")
+        self.prop_method_group.addButton(self.prop_manual_radio, 1)
+        manual_layout.addWidget(self.prop_manual_radio)
+        
+        self.prop_ids_input = QLineEdit()
+        self.prop_ids_input.setPlaceholderText("e.g., all / 101,102 / 101:201")
+        self.prop_ids_input.setEnabled(False)
+        manual_layout.addWidget(self.prop_ids_input, 1)
+        
+        pg_layout.addLayout(manual_layout)
+        
+        self.prop_manual_radio.toggled.connect(
+            lambda checked: self.prop_ids_input.setEnabled(checked)
+        )
+        
+        prop_group.setLayout(pg_layout)
+        layout.addWidget(prop_group)
+        
+        # ALGORITHM SELECTION GROUP
+        algo_group = QGroupBox("ALGORITHM")
+        ag_layout = QVBoxLayout()
+        
+        self.algo_method_group = QButtonGroup()
+        
+        self.algo_lazy_radio = QRadioButton("Lazy (iterative thickness addition)")
+        self.algo_gauss_radio = QRadioButton("Gaussian Process (optimization)")
+        
+        self.algo_method_group.addButton(self.algo_lazy_radio, 0)
+        self.algo_method_group.addButton(self.algo_gauss_radio, 1)
+        self.algo_lazy_radio.setChecked(True)
+        
+        ag_layout.addWidget(self.algo_lazy_radio)
+        ag_layout.addWidget(self.algo_gauss_radio)
+        
+        if not SKOPT_AVAILABLE:
+            self.algo_gauss_radio.setEnabled(False)
+            self.algo_gauss_radio.setToolTip("Install scikit-optimize: pip install scikit-optimize")
+        
+        algo_group.setLayout(ag_layout)
+        layout.addWidget(algo_group)
+        
+        # SETTINGS GROUP
+        settings = QGroupBox("SETTINGS")
+        sl = QVBoxLayout()
+        
+        hl = QHBoxLayout()
+        self.thickness_label = QLabel("Thickness (mm):")
+        hl.addWidget(self.thickness_label)
+        self.thickness_addition = QDoubleSpinBox()
+        self.thickness_addition.setRange(0.1, 50.0)
+        self.thickness_addition.setValue(0.736)
+        self.thickness_addition.setDecimals(3)
+        hl.addWidget(self.thickness_addition)
+        sl.addLayout(hl)
+        
+        self.algo_lazy_radio.toggled.connect(self.update_thickness_mode)
+        self.algo_gauss_radio.toggled.connect(self.update_thickness_mode)
+
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Target RF:"))
+        self.target_rf = QDoubleSpinBox()
+        self.target_rf.setRange(1.0, 5.0)
+        self.target_rf.setValue(1.0)
+        self.target_rf.setDecimals(2)
+        hl.addWidget(self.target_rf)
+        sl.addLayout(hl)
+        
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Max Iterations:"))
+        self.max_iterations = QSpinBox()
+        self.max_iterations.setRange(1, 100)
+        self.max_iterations.setValue(20)
+        hl.addWidget(self.max_iterations)
+        sl.addLayout(hl)
+        
+        settings.setLayout(sl)
+        layout.addWidget(settings)
+        
+        # STATUS GROUP
+        status = QGroupBox("STATUS")
+        stl = QVBoxLayout()
+        
+        self.progress = QProgressBar()
+        stl.addWidget(self.progress)
+        
+        for lbl, attr, clr in [("Status", "status_label", "#ff8800"),
+                               ("Iteration", "iteration_label", "#00ff00"),
+                               ("Critical", "critical_label", "#ff4400")]:
+            hl = QHBoxLayout()
+            hl.addWidget(QLabel(f"{lbl}:"))
+            label = QLabel("Ready" if lbl == "Status" else ("0/0" if lbl == "Iteration" else "---"))
+            label.setStyleSheet(f"color: {clr}; font-weight: bold;")
+            setattr(self, attr, label)
+            hl.addWidget(label, 1)
+            stl.addLayout(hl)
+        
+        status.setLayout(stl)
+        layout.addWidget(status)
+        
+        # START BUTTON
+        self.start_btn = QPushButton("▶ Start Optimization")
+        self.start_btn.setMinimumHeight(40)
+        self.start_btn.clicked.connect(self.start_optimization)
+        layout.addWidget(self.start_btn)
+        
+        # LOG
+        log = QGroupBox("LOG")
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        QVBoxLayout(log).addWidget(self.log_text)
+        layout.addWidget(log, 1)
+        
+        return widget
+    
+    def update_thickness_mode(self):
+        """Update thickness input label and range based on selected algorithm"""
+        if self.algo_lazy_radio.isChecked():
+            self.thickness_label.setText("Thickness (mm):")
+            self.thickness_addition.setRange(0.1, 50.0)
+            self.thickness_addition.setValue(0.736)
+            self.thickness_addition.setDecimals(3)
+            self.thickness_addition.setSuffix("")
+        else:
+            self.thickness_label.setText("Multiplier:")
+            self.thickness_addition.setRange(1.0, 10.0)
+            self.thickness_addition.setValue(3.0)
+            self.thickness_addition.setDecimals(1)
+        
+    def parse_property_ids(self, input_str: str, bdf) -> Set[int]:
+        """Parse property ID input string and return set of property IDs"""
+        input_str = input_str.strip().lower()
+        
+        if input_str == 'all':
+            all_props = set()
+            for pid, prop in bdf.properties.items():
+                if prop.type in ['PCOMP', 'PCOMPG', 'PSHELL']:
+                    all_props.add(pid)
+            self.log(f"Selected ALL properties: {len(all_props)} found")
+            return all_props
+        
+        prop_ids = set()
+        parts = input_str.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            if ':' in part:
+                try:
+                    start, end = part.split(':')
+                    start, end = int(start), int(end)
+                    prop_ids.update(range(start, end + 1))
+                except ValueError:
+                    self.log(f"<span style='color:#ffb74d'>Warning: Invalid range '{part}'</span>")
+            else:
+                try:
+                    prop_ids.add(int(part))
+                except ValueError:
+                    self.log(f"<span style='color:#ffb74d'>Warning: Invalid ID '{part}'</span>")
+        
+        valid_props = set()
+        for pid in prop_ids:
+            if pid in bdf.properties:
+                prop = bdf.properties[pid]
+                if prop.type in ['PCOMP', 'PCOMPG', 'PSHELL']:
+                    valid_props.add(pid)
+                else:
+                    self.log(f"<span style='color:#ffb74d'>Warning: PID {pid} not composite/shell</span>")
+            else:
+                self.log(f"<span style='color:#ffb74d'>Warning: PID {pid} not found in BDF</span>")
+        
+        self.log(f"Selected {len(valid_props)} properties: {sorted(list(valid_props))[:10]}{'...' if len(valid_props) > 10 else ''}")
+        return valid_props
+        
+    
+    def log(self, msg):
+        self.log_text.append(f"<span style='color:#808080'>{time.strftime('%H:%M:%S')}</span> {msg}")
+        QApplication.processEvents()
+    
+    def my_read_bdf(self, path):
+        """Try reading BDF with different parameter combinations"""
+        for punch in [False, True]:
+            for xref in [False, True]:
+                try:
+                    return read_bdf(path, xref=xref, punch=punch)
+                except:
+                    continue
+        raise IOError(f"Failed to read BDF: {path}")
+    
+    def browse_bdf(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select BDF", "", "BDF (*.bdf)")
+        if f: self.bdf_path.setText(f)
+    
+    def browse_op2(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select OP2", "", "OP2 (*.op2)")
+        if f: self.op2_path.setText(f)
+    
+    def browse_excel(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select Excel", "", "Excel (*.xlsx *.xls)")
+        if f: self.excel_path.setText(f)
+    
+    def browse_nastran(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select Nastran", "", "EXE (*.exe)")
+        if f: self.nastran_path.setText(f)
+        
+    
+    def start_optimization(self):
+        """Main entry point for optimization - starts worker thread"""
+        # Validate file paths
+        for p, n in [(self.bdf_path, "BDF"), (self.op2_path, "OP2"),
+                     (self.excel_path, "Excel"), (self.nastran_path, "Nastran")]:
+            if not os.path.exists(p.text()):
+                QMessageBox.critical(self, "Error", f"{n} not found!")
+                return
+        
+        if self.algo_gauss_radio.isChecked() and not SKOPT_AVAILABLE:
+            QMessageBox.critical(self, "Error", 
+                "Gaussian Process requires scikit-optimize.\nInstall with: pip install scikit-optimize")
+            return
+        
+        if self.prop_manual_radio.isChecked():
+            if not self.prop_ids_input.text().strip():
+                QMessageBox.critical(self, "Error", "Please enter property IDs!")
+                return
+        
+        # Disable button and reset state
+        self.start_btn.setEnabled(False)
+        self.status_label.setText("Running...")
+        self.iteration_data = []
+        self.node_to_shells_cache = None
+        self.target_pcomp_ids = None
+        
+        # Calculate initial mass
+        try:
+            bdf = self.my_read_bdf(self.bdf_path.text())
+            self.initial_mass, _, _ = mass_properties(bdf)
+            self.log(f"<span style='color:#81c784'>Initial mass: {self.initial_mass:.2f} kg</span>")
+        except Exception as e:
+            self.log(f"<span style='color:#ffb74d'>Warning: Could not calculate mass - {e}</span>")
+            self.initial_mass = None
+        
+        # Create and configure worker thread
+        self.worker = OptimizationWorker(self)
+        self.worker.algorithm = 'lazy' if self.algo_lazy_radio.isChecked() else 'gaussian'
+        
+        # Connect signals
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.status_signal.connect(self.update_status)
+        self.worker.finished_signal.connect(self.optimization_finished)
+        
+        # Start the thread
+        self.worker.start()
+    
+    def update_status(self, text, color):
+        """Update status label from thread"""
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+    
+    
+    def optimization_finished(self, success, message):
+        """Called when optimization thread completes"""
+        self.status_label.setText("✓ Done" if success else "⚠ Stopped")
+        self.status_label.setStyleSheet(f"color: {'#81c784' if success else '#ffb74d'}; font-weight: bold;")
+        
+        (QMessageBox.information if success else QMessageBox.warning)(self, "Result", message)
+        
+        self.start_btn.setEnabled(True)
+        self.worker = None
+    
+    def run_lazy_optimization_thread(self):
+        """Iterative thickness addition algorithm - RUNS IN THREAD"""
+        bdf_orig = self.bdf_path.text()
+        op2_orig = self.op2_path.text()
+        excel = self.excel_path.text()
+        nastran = self.nastran_path.text()
+        thick_add = self.thickness_addition.value()
+        target = self.target_rf.value()
+        max_iter = self.max_iterations.value()
+        
+        work_dir = os.path.dirname(bdf_orig)
+        base = os.path.splitext(os.path.basename(bdf_orig))[0]
+        
+        current_bdf = bdf_orig
+        current_op2 = op2_orig
+        
+        # Read Excel
+        self.worker.log_signal.emit("Reading Excel...")
+        df_in = pd.read_excel(excel).sort_values('elid').reset_index(drop=True)
+        given_list = df_in["elid"].tolist()
+        
+        use_neighbor = self.prop_neighbor_radio.isChecked()
+        
+        if use_neighbor:
+            self.worker.log_signal.emit("Property selection: NEIGHBOR APPROACH")
+        else:
+            self.worker.log_signal.emit("Property selection: MANUAL IDs")
+        
+        self.worker.log_signal.emit(f"Monitoring {len(df_in)} elements | RF: {target} | +{thick_add}mm")
+        self.worker.log_signal.emit("="*60)
+        
+        iteration = 0
+        all_updated = set()
+        
+        if use_neighbor:
+            self.target_pcomp_ids = set()
+        
+        while iteration < max_iter:
+            iteration += 1
+            self.worker.log_signal.emit(f"\n<span style='color:#4fc3f7;font-weight:bold'>ITERATION {iteration}</span>")
+            
+            iter_dir = os.path.join(work_dir, f"iteration_{iteration}")
+            os.makedirs(iter_dir, exist_ok=True)
+            
+            bdf = self.my_read_bdf(current_bdf)
+            
+            if use_neighbor and (self.node_to_shells_cache is None or iteration == 1):
+                self.worker.log_signal.emit("Building connectivity cache...")
+                self.node_to_shells_cache = self.build_connectivity(bdf)
+            
+            if not use_neighbor and iteration == 1:
+                self.target_pcomp_ids = self.parse_property_ids(
+                    self.prop_ids_input.text(), bdf
+                )
+                if not self.target_pcomp_ids:
+                    return False, "No valid property IDs specified!"
+            
+            op2 = read_op2(current_op2, build_dataframe=True)
+            
+            if use_neighbor:
+                df_res = self.calc_rf_with_neighbors(bdf, op2, df_in, given_list)
+            else:
+                df_res = self.calc_rf_simple(bdf, op2, df_in, given_list)
+            
+            df_crit = df_res[df_res['RF'] < target]
+            n_crit = len(df_crit)
+            
+            try:
+                mass, _, _ = mass_properties(bdf)
+                self.worker.log_signal.emit(f"Mass: {mass:.2f} kg")
+            except Exception as e:
+                self.worker.log_signal.emit(f"<span style='color:#ffb74d'>Mass calculation failed: {e}</span>")
+                mass = None
+            
+            # REPLACE self.update_progress with signal emission
+            self.worker.progress_signal.emit(iteration, max_iter, n_crit, 
+                                            df_res['RF'].dropna().tolist(), mass)
+            
+            if n_crit == 0:
+                final_bdf = os.path.join(work_dir, f"{base}_optimized.bdf")
+                shutil.copy2(current_bdf, final_bdf)
+                res_file = self.save_results(work_dir, base, iteration, df_res, all_updated)
+                return True, f"✓ Optimization converged!\n\nAll elements meet RF ≥ {target}\n\nResults: {res_file}\nBDF: {final_bdf}"
+            
+            self.worker.log_signal.emit(f"<span style='color:#e57373'>Critical elements: {n_crit}</span>")
+            
+            if use_neighbor:
+                pcomp_upd = set()
+                for ns in df_crit['neighbors']:
+                    if pd.notna(ns) and ns != '[]':
+                        try:
+                            pcomp_upd.update(ast.literal_eval(ns))
+                        except:
+                            pass
+                
+                if not pcomp_upd:
+                    return False, "No PCOMP neighbors found for critical elements!"
+                
+                self.target_pcomp_ids.update(pcomp_upd)
+            else:
+                pcomp_upd = self.target_pcomp_ids.copy()
+            
+            self.worker.log_signal.emit(f"Updating {len(pcomp_upd)} properties")
+            
+            upd = self.update_pcomp(bdf, pcomp_upd, thick_add)
+            all_updated.update(upd)
+            
+            iter_bdf = os.path.join(iter_dir, f"{base}_iteration{iteration}.bdf")
+            bdf.write_bdf(iter_bdf)
+            self.worker.log_signal.emit(f"Saved: {iter_bdf}")
+            
+            iter_excel = os.path.join(iter_dir, f"iteration{iteration}_results.xlsx")
+            with pd.ExcelWriter(iter_excel) as w:
+                df_res.to_excel(w, 'All', index=False)
+                df_crit.to_excel(w, 'Critical', index=False)
+            self.worker.log_signal.emit(f"Saved: {iter_excel}")
+            
+            current_bdf = iter_bdf
+            
+            self.worker.log_signal.emit("Running Nastran...")
+            if not self.run_nastran(nastran, iter_bdf):
+                return False, "Nastran analysis failed!"
+            
+            iter_op2 = iter_bdf.replace('.bdf', '.op2')
+            time.sleep(1)
+            
+            if os.path.exists(iter_op2):
+                current_op2 = iter_op2
+                self.worker.log_signal.emit(f"Using OP2: {current_op2}")
+            else:
+                self.worker.log_signal.emit("<span style='color:#ffb74d'>Warning: OP2 not found, using original</span>")
+                current_op2 = op2_orig
+        
+        final_bdf = os.path.join(work_dir, f"{base}_optimized_maxiter.bdf")
+        shutil.copy2(current_bdf, final_bdf)
+        res_file = self.save_results(work_dir, base, iteration, df_res, all_updated)
+        return False, f"⚠ Max iterations reached\n\nCritical elements: {n_crit}\n\nResults: {res_file}\nBDF: {final_bdf}"
+    
+    def run_gaussian_optimization_thread(self):
+        """Gaussian Process optimization - RUNS IN THREAD"""
+        bdf_orig = self.bdf_path.text()
+        op2_orig = self.op2_path.text()
+        excel = self.excel_path.text()
+        nastran = self.nastran_path.text()
+        target_rf = self.target_rf.value()
+        max_iter = self.max_iterations.value()
+        
+        work_dir = os.path.dirname(bdf_orig)
+        base = os.path.splitext(os.path.basename(bdf_orig))[0]
+        
+        # Read Excel
+        self.worker.log_signal.emit("Reading Excel...")
+        df_in = pd.read_excel(excel).sort_values('elid').reset_index(drop=True)
+        given_list = df_in["elid"].tolist()
+        
+        # Determine property selection
+        use_neighbor = self.prop_neighbor_radio.isChecked()
+        
+        if use_neighbor:
+            self.worker.log_signal.emit("Property selection: NEIGHBOR APPROACH")
+            
+            bdf = self.my_read_bdf(bdf_orig)
+            self.node_to_shells_cache = self.build_connectivity(bdf)
+            op2 = read_op2(op2_orig, build_dataframe=True)
+            
+            self.target_pcomp_ids = set()
+            df_res = self.calc_rf_with_neighbors(bdf, op2, df_in, given_list)
+            df_crit = df_res[df_res['RF'] < target_rf]
+            
+            pcomp_target = set()
+            for ns in df_crit['neighbors']:
+                if pd.notna(ns) and ns != '[]':
+                    try:
+                        pcomp_target.update(ast.literal_eval(ns))
+                    except:
+                        pass
+            
+            if not pcomp_target:
+                return False, "No PCOMP neighbors found!"
+            
+            self.target_pcomp_ids = pcomp_target
+        else:
+            self.worker.log_signal.emit("Property selection: MANUAL IDs")
+            bdf = self.my_read_bdf(bdf_orig)
+            self.target_pcomp_ids = self.parse_property_ids(
+                self.prop_ids_input.text(), bdf
+            )
+            if not self.target_pcomp_ids:
+                return False, "No valid property IDs specified!"
+        
+        self.worker.log_signal.emit(f"Optimizing {len(self.target_pcomp_ids)} properties")
+        self.worker.log_signal.emit(f"Target RF: {target_rf}")
+        self.worker.log_signal.emit("="*60)
+        
+        # Store original thicknesses
+        bdf_orig_obj = self.my_read_bdf(bdf_orig)
+        original_thicknesses = {}
+        for pid in self.target_pcomp_ids:
+            prop = bdf_orig_obj.properties[pid]
+            if prop.type in ['PCOMP', 'PCOMPG']:
+                original_thicknesses[pid] = prop.thicknesses[0]
+            elif prop.type == 'PSHELL':
+                original_thicknesses[pid] = prop.t
+        
+        # Define objective function
+        iteration_count = [0]
+        
+        def objective(thickness_multipliers):
+            iteration_count[0] += 1
+            iteration = iteration_count[0]
+            
+            self.worker.log_signal.emit(f"\n<span style='color:#4fc3f7;font-weight:bold'>GP ITERATION {iteration}</span>")
+            
+            # Create iteration directory
+            iter_dir = os.path.join(work_dir, f"gp_iteration_{iteration}")
+            os.makedirs(iter_dir, exist_ok=True)
+            
+            # Create modified BDF
+            bdf = self.my_read_bdf(bdf_orig)
+            
+            # Apply thickness multipliers
+            for i, pid in enumerate(sorted(self.target_pcomp_ids)):
+                multiplier = thickness_multipliers[i]
+                prop = bdf.properties[pid]
+                
+                if prop.type in ['PCOMP', 'PCOMPG']:
+                    prop.thicknesses[0] = original_thicknesses[pid] * multiplier
+                elif prop.type == 'PSHELL':
+                    prop.t = original_thicknesses[pid] * multiplier
+            
+            # Save iteration BDF
+            iter_bdf = os.path.join(iter_dir, f"{base}_gp{iteration}.bdf")
+            bdf.write_bdf(iter_bdf)
+            
+            # Run Nastran
+            self.worker.log_signal.emit("Running Nastran...")
+            if not self.run_nastran(nastran, iter_bdf):
+                self.worker.log_signal.emit("<span style='color:#e57373'>Nastran failed, returning penalty</span>")
+                return 1e6
+            
+            # Wait for OP2
+            time.sleep(2)
+            
+            # Find OP2
+            iter_op2 = iter_bdf.replace('.bdf', '.op2')
+            if not os.path.exists(iter_op2):
+                self.worker.log_signal.emit("<span style='color:#e57373'>OP2 not found, returning penalty</span>")
+                return 1e6
+            
+            # Calculate RF
+            try:
+                op2 = read_op2(iter_op2, build_dataframe=True)
+                df_res = self.calc_rf_simple(bdf, op2, df_in, given_list)
+                
+                df_crit = df_res[df_res['RF'] < target_rf]
+                n_crit = len(df_crit)
+                
+                # Calculate mass
+                try:
+                    mass, _, _ = mass_properties(bdf)
+                except:
+                    mass = None
+                
+                # Update UI via signal
+                self.worker.progress_signal.emit(iteration, max_iter, n_crit,
+                                   df_res['RF'].dropna().tolist(), mass)
+                
+                # Objective: minimize critical count + mass penalty
+                mass_penalty = 0
+                if mass and self.initial_mass:
+                    mass_increase = (mass - self.initial_mass) / self.initial_mass
+                    mass_penalty = max(0, mass_increase * 100)
+                
+                objective_value = n_crit + mass_penalty
+                
+                self.worker.log_signal.emit(f"Critical: {n_crit}, Mass penalty: {mass_penalty:.2f}, Objective: {objective_value:.2f}")
+                
+                # Save results
+                with pd.ExcelWriter(os.path.join(iter_dir, f"gp{iteration}_results.xlsx")) as w:
+                    df_res.to_excel(w, 'All', index=False)
+                    df_crit.to_excel(w, 'Critical', index=False)
+                
+                return objective_value
+                
+            except Exception as e:
+                self.worker.log_signal.emit(f"<span style='color:#e57373'>Error in evaluation: {e}</span>")
+                return 1e6
+        
+        # Define search space
+        n_props = len(self.target_pcomp_ids)
+        max_multi = self.thickness_addition.value()
+        space = [Real(1.0, max_multi, name=f'mult_{i}') for i in range(n_props)]
+        x0 = [1.0] * n_props
+        
+        self.worker.log_signal.emit(f"Starting Gaussian Process optimization...")
+        self.worker.log_signal.emit(f"Search space: {n_props} properties, multipliers [1.0, {max_multi:.1f}]")
+        
+        # Run optimization
+        try:
+            result = gp_minimize(
+                objective,
+                space,
+                x0=[x0],
+                n_calls=min(max_iter, 30),
+                random_state=42,
+                verbose=False
+            )
+            
+            self.worker.log_signal.emit(f"\n<span style='color:#81c784'>GP Optimization complete!</span>")
+            self.worker.log_signal.emit(f"Best objective: {result.fun:.2f}")
+            self.worker.log_signal.emit(f"Best multipliers: {[f'{x:.3f}' for x in result.x]}")
+            
+            # Apply best solution
+            bdf = self.my_read_bdf(bdf_orig)
+            
+            for i, pid in enumerate(sorted(self.target_pcomp_ids)):
+                multiplier = result.x[i]
+                prop = bdf.properties[pid]
+                
+                if prop.type in ['PCOMP', 'PCOMPG']:
+                    new_thick = original_thicknesses[pid] * multiplier
+                    prop.thicknesses[0] = new_thick
+                    self.worker.log_signal.emit(f"  PID {pid}: {original_thicknesses[pid]:.3f} → {new_thick:.3f} mm (×{multiplier:.3f})")
+                elif prop.type == 'PSHELL':
+                    new_thick = original_thicknesses[pid] * multiplier
+                    prop.t = new_thick
+                    self.worker.log_signal.emit(f"  PID {pid}: {original_thicknesses[pid]:.3f} → {new_thick:.3f} mm (×{multiplier:.3f})")
+            
+            # Save final BDF (only once - removed redundancy!)
+            final_bdf = os.path.join(work_dir, f"{base}_optimized_gp.bdf")
+            bdf.write_bdf(final_bdf)
+            
+            # Run Nastran on final BDF
+            self.run_nastran(nastran, final_bdf)
+            time.sleep(2)
+            
+            # Final evaluation
+            final_op2 = final_bdf.replace('.bdf', '.op2')
+            if os.path.exists(final_op2):
+                op2 = read_op2(final_op2, build_dataframe=True)
+                df_res = self.calc_rf_simple(bdf, op2, df_in, given_list)
+                
+                res_file = self.save_results(work_dir, base, iteration_count[0], 
+                                            df_res, self.target_pcomp_ids)
+                
+                n_crit_final = len(df_res[df_res['RF'] < target_rf])
+                
+                if n_crit_final == 0:
+                    return True, f"✓ GP Optimization converged!\n\nResults: {res_file}\nBDF: {final_bdf}"
+                else:
+                    return False, f"⚠ GP completed but {n_crit_final} critical elements remain\n\nResults: {res_file}\nBDF: {final_bdf}"
+            else:
+                return False, "Could not perform final evaluation"
+                
+        except Exception as e:
+            self.worker.log_signal.emit(f"<span style='color:#e57373'>GP optimization error: {e}</span>")
+            raise
+    
+        
+    def calc_rf_with_neighbors(self, bdf, op2, df_in, given_list):
+        """Calculate RF WITH neighbor detection"""
+        cbar = getattr(op2.op2_results.force, 'cbar_force', None) or op2.cbar_force
+        
+        df_f = pd.concat([df.dataframe.reset_index().assign(LoadCase=lc) 
+                         for lc, df in cbar.items()], ignore_index=True)
+        
+        df_f = df_f[df_f['ElementID'].isin(given_list)]
+        df_env = df_f.loc[df_f.groupby('ElementID')['axial'].idxmax(), 
+                         ['ElementID', 'axial', 'LoadCase']].reset_index(drop=True)
+        
+        df_res = df_in.merge(df_env, left_on='elid', right_on='ElementID', how='left')
+        df_res.drop(columns=['ElementID'], inplace=True)
+        
+        dims, neighs, strs, rfs = [], [], [], []
+        
+        for _, row in df_res.iterrows():
+            elem = bdf.elements[row['elid']]
+            prop = bdf.properties[elem.pid]
+            
+            if prop.type == "PBARL":
+                w, t = prop.dim[0], prop.dim[1]
+                dims.append([w, t])
+                
+                neighs.append(self.find_neighbors(bdf, row['elid'], self.angle_tolerance))
+                
+                stress = row['axial'] / (w * t)
+                strs.append(stress)
+                rfs.append(abs(row['allowable'] / (stress + 1e-6)))
+            else:
+                dims.append(None)
+                neighs.append([])
+                strs.append(np.nan)
+                rfs.append(np.nan)
+        
+        # Get thicknesses (handle empty target_pcomp_ids)
+        thicknesses = []
+        if self.target_pcomp_ids:
+            for pid in sorted(list(self.target_pcomp_ids)):
+                if pid in bdf.properties:
+                    if bdf.properties[pid].type == "PCOMP":
+                        thicknesses.append(bdf.properties[pid].thicknesses[0])
+                    elif bdf.properties[pid].type == "PSHELL":
+                        thicknesses.append(bdf.properties[pid].t)
+                
+        df_res['dim'] = [str(d) for d in dims]
+        df_res['neighbors'] = [str(n) for n in neighs]
+        df_res['neighbors_thicks'] = str(thicknesses)
+        df_res['stress'] = strs
+        df_res['RF'] = rfs
+        
+        return df_res
+    
+    def calc_rf_simple(self, bdf, op2, df_in, given_list):
+        """Calculate RF WITHOUT neighbor detection"""
+        cbar = getattr(op2.op2_results.force, 'cbar_force', None) or op2.cbar_force
+        
+        df_f = pd.concat([df.dataframe.reset_index().assign(LoadCase=lc) 
+                         for lc, df in cbar.items()], ignore_index=True)
+        
+        df_f = df_f[df_f['ElementID'].isin(given_list)]
+        df_env = df_f.loc[df_f.groupby('ElementID')['axial'].idxmax(), 
+                         ['ElementID', 'axial', 'LoadCase']].reset_index(drop=True)
+        
+        df_res = df_in.merge(df_env, left_on='elid', right_on='ElementID', how='left')
+        df_res.drop(columns=['ElementID'], inplace=True)
+        
+        dims, strs, rfs = [], [], []
+        
+        for _, row in df_res.iterrows():
+            elem = bdf.elements[row['elid']]
+            prop = bdf.properties[elem.pid]
+            
+            if prop.type == "PBARL":
+                w, t = prop.dim[0], prop.dim[1]
+                dims.append([w, t])
+                
+                stress = row['axial'] / (w * t)
+                strs.append(stress)
+                rfs.append(abs(row['allowable'] / (stress + 1e-6)))
+            else:
+                dims.append(None)
+                strs.append(np.nan)
+                rfs.append(np.nan)
+        
+        # Get thicknesses (handle empty target_pcomp_ids)
+        thicknesses = []
+        if self.target_pcomp_ids:
+            for pid in sorted(list(self.target_pcomp_ids)):
+                if pid in bdf.properties:
+                    if bdf.properties[pid].type == "PCOMP":
+                        thicknesses.append(bdf.properties[pid].thicknesses[0])
+                    elif bdf.properties[pid].type == "PSHELL":
+                        thicknesses.append(bdf.properties[pid].t)
+                
+        df_res['dim'] = [str(d) for d in dims]
+        df_res['chosen_pids'] = str(sorted(list(self.target_pcomp_ids))) if self.target_pcomp_ids else "[]"
+        df_res['chosen_thicks'] = str(thicknesses)
+        df_res['stress'] = strs
+        df_res['RF'] = rfs
+        
+        return df_res
+    
+    
+    def find_neighbors(self, bdf, elid: int, tol: float = 30.0) -> List[int]:
+        """Find neighboring PCOMP/PSHELL properties connected to a CBAR element"""
+        bar = bdf.elements[elid]
+        
+        p1 = np.array(bdf.nodes[bar.nodes[0]].get_position())
+        p2 = np.array(bdf.nodes[bar.nodes[1]].get_position())
+        
+        bar_x = (p2 - p1)
+        bar_x /= np.linalg.norm(bar_x)
+        
+        v = (np.array(bdf.nodes[bar.g0].get_position()) - p1 if bar.g0 
+             else np.array(bar.x))
+        
+        if np.abs(np.dot(v/np.linalg.norm(v), bar_x)) > 0.99:
+            v = np.array([1,0,0]) if np.abs(bar_x[0]) < 0.9 else np.array([0,1,0])
+        
+        v_proj = v - np.dot(v, bar_x) * bar_x
+        bar_y = v_proj / np.linalg.norm(v_proj)
+        bar_z = np.cross(bar_x, bar_y)
+        
+        cands = set()
+        for nid in bar.nodes:
+            cands.update(self.node_to_shells_cache.get(nid, []))
+        
+        neighs = []
+        bar_set = set(bar.nodes)
+        
+        for eid in cands:
+            elem = bdf.elements[eid]
+            
+            if len(set(elem.nodes) & bar_set) >= 2:
+                prop = bdf.properties.get(elem.pid)
+                
+                if prop and prop.type in ['PCOMP', 'PCOMPG', 'PSHELL']:
+                    nodes = (elem.nodes[:4] if elem.type in ['CQUAD4','CQUAD8'] 
+                            else elem.nodes[:3])
+                    
+                    p0 = np.array(bdf.nodes[nodes[0]].get_position())
+                    p1 = np.array(bdf.nodes[nodes[1]].get_position())
+                    p2 = np.array(bdf.nodes[nodes[2]].get_position())
+                    
+                    norm = np.cross(p1-p0, p2-p0)
+                    norm /= np.linalg.norm(norm)
+                    
+                    ang = np.arccos(np.clip(np.abs(np.dot(bar_z, norm)), 0, 1)) * 180/np.pi
+                    
+                    if ang <= tol and elem.pid not in neighs:
+                        neighs.append(elem.pid)
+        
+        return neighs
+    
+    def build_connectivity(self, bdf) -> Dict[int, List[int]]:
+        """Build node-to-shell-element connectivity map"""
+        node_to_elems = {}
+        
+        for eid, elem in bdf.elements.items():
+            if elem.type in ['CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6']:
+                for nid in elem.nodes:
+                    node_to_elems.setdefault(nid, []).append(eid)
+        
+        self.log(f"Built connectivity: {len(node_to_elems)} nodes")
+        return node_to_elems
+    
+    def update_pcomp(self, bdf, pids: Set[int], add_mm: float) -> List[int]:
+        """Update PCOMP/PSHELL thicknesses by adding specified amount"""
+        upd = []
+        
+        for pid in sorted(pids):
+            if pid in bdf.properties:
+                prop = bdf.properties[pid]
+                
+                if prop.type in ['PCOMP', 'PCOMPG']:
+                    old_thick = prop.thicknesses[0]
+                    prop.thicknesses[0] += add_mm
+                    new_thick = prop.thicknesses[0]
+                    total = sum(prop.thicknesses)
+                    
+                    upd.append(pid)
+                    self.log(f"  PID {pid}: {old_thick:.3f} → {new_thick:.3f} mm (total: {total:.3f} mm)")
+                    
+                elif prop.type == 'PSHELL':
+                    old_thick = prop.t
+                    prop.t += add_mm
+                    new_thick = prop.t
+                    
+                    upd.append(pid)
+                    self.log(f"  PID {pid}: {old_thick:.3f} → {new_thick:.3f} mm")
+        
+        return upd
+    
+    def run_nastran(self, exe: str, bdf: str) -> bool:
+        """Run Nastran analysis"""
+        try:
+            result = subprocess.call(
+                [exe, os.path.basename(bdf), "scr=yes", "old=no"],
+                cwd=os.path.dirname(bdf),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Wait for Nastran processes
+            time.sleep(2)
+            while True:
+                nastran_running = False
+                for p in psutil.process_iter(["name"]):
+                    if "nastran" in p.info["name"].lower():
+                        nastran_running = True
+                        break
+                
+                if not nastran_running:
+                    break
+                time.sleep(1)
+            
+            if result != 0:
+                self.log(f"<span style='color:#e57373'>Nastran returned code: {result}</span>")
+                return False
+            
+            self.log("<span style='color:#81c784'>✓ Nastran completed</span>")
+            return True
+            
+        except Exception as e:
+            self.log(f"<span style='color:#e57373'>Nastran error: {e}</span>")
+            return False
+        
+    def update_progress(self, iteration: int, max_iter: int, 
+                       n_crit: int, rf_values: List[float], mass: Optional[float]):
+        """Update progress bar, labels, and store iteration data"""
+        self.progress.setValue(int(iteration / max_iter * 100))
+        self.iteration_label.setText(f"{iteration}/{max_iter}")
+        self.critical_label.setText(str(n_crit))
+        
+        self.iteration_data.append({
+            'iteration': iteration,
+            'critical_count': n_crit,
+            'rf_values': rf_values,
+            'mass': mass
+        })
+        
+        self.update_plots()
+    
+    def update_plots(self):
+        """Update convergence and mass plots"""
+        if not self.iteration_data:
+            return
+        
+        iters = [d['iteration'] for d in self.iteration_data]
+        crits = [d['critical_count'] for d in self.iteration_data]
+        
+        # Plot 1 - Convergence
+        self.ax1.clear()
+        self.ax1.plot(iters, crits, 'o-', color='#ff4400', lw=1.5, ms=4, label='Critical')
+        self.ax1.axhline(0, color='#00ff00', ls='--', lw=1, label='Target', alpha=0.7)
+        self.ax1.set_xlabel('Iteration', color='#888888', fontsize=9, family='monospace')
+        self.ax1.set_ylabel('Critical Elements', color='#888888', fontsize=9, family='monospace')
+        self.ax1.set_title('CONVERGENCE', color='#ff8800', fontweight='bold', fontsize=10, family='monospace')
+        self.ax1.grid(True, alpha=0.15, color='#444444', linestyle='-', linewidth=0.5)
+        self.ax1.tick_params(colors='#666666', labelsize=8)
+        self.ax1.legend(facecolor='#1a1a1a', edgecolor='#ff6600', loc='best', framealpha=0.9, fontsize=8)
+        self.ax1.set_facecolor('#0f0f0f')
+        for spine in ['bottom', 'left']:
+            self.ax1.spines[spine].set_color('#ff6600')
+        for spine in ['top', 'right']:
+            self.ax1.spines[spine].set_color('#444444')
+        self.ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        
+        # Plot 2 - Mass
+        self.ax2.clear()
+        
+        mass_data = [(d['iteration'], d['mass']) for d in self.iteration_data 
+                     if d.get('mass') is not None]
+        
+        if mass_data:
+            mass_iters, mass_vals = zip(*mass_data)
+            
+            self.ax2.plot(mass_iters, mass_vals, 'o-', color='#ff6600', lw=1.5, ms=4, label='Mass')
+            
+            if self.initial_mass:
+                self.ax2.axhline(self.initial_mass, color='#ffaa00', ls='--', lw=1, 
+                               label=f'Initial ({self.initial_mass:.1f} kg)', alpha=0.7)
+            
+            self.ax2.set_xlabel('Iteration', color='#888888', fontsize=9, family='monospace')
+            self.ax2.set_ylabel('Mass (kg)', color='#888888', fontsize=9, family='monospace')
+            self.ax2.set_title('MASS', color='#ff8800', fontweight='bold', fontsize=10, family='monospace')
+            self.ax2.grid(True, alpha=0.15, color='#444444', linestyle='-', linewidth=0.5)
+            self.ax2.tick_params(colors='#666666', labelsize=8)
+            self.ax2.legend(facecolor='#1a1a1a', edgecolor='#ff6600', loc='best', framealpha=0.9, fontsize=8)
+            self.ax2.set_facecolor('#0f0f0f')
+            for spine in ['bottom', 'left']:
+                self.ax2.spines[spine].set_color('#ff6600')
+            for spine in ['top', 'right']:
+                self.ax2.spines[spine].set_color('#444444')
+            self.ax2.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            
+            if self.initial_mass and len(mass_vals) > 0:
+                final_mass = mass_vals[-1]
+                pct_change = ((final_mass - self.initial_mass) / self.initial_mass) * 100
+                color = '#ff4400' if pct_change > 0 else '#00ff00'
+                self.ax2.text(0.02, 0.98, f'Δ {pct_change:+.1f}%', 
+                            transform=self.ax2.transAxes, verticalalignment='top',
+                            color=color, fontweight='bold', fontsize=9, family='monospace',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='#1a1a1a', 
+                                    edgecolor=color, linewidth=1))
+        else:
+            self.ax2.text(0.5, 0.5, 'Mass data unavailable', 
+                        transform=self.ax2.transAxes,
+                        ha='center', va='center', color='#888888', 
+                        fontsize=10, family='monospace')
+            self.ax2.set_facecolor('#0f0f0f')
+            for spine in self.ax2.spines.values():
+                spine.set_color('#444444')
+        
+        self.fig.tight_layout(pad=2.0)
+        self.canvas.draw()
+        QApplication.processEvents()
+    
+    def create_right_panel(self):
+        """Create right panel with plots"""
+        widget = QWidget()
+        
+        plt.style.use('dark_background')
+        
+        self.fig = Figure(figsize=(10, 8), facecolor='#0a0a0a')
+        self.ax1 = self.fig.add_subplot(211, facecolor='#0f0f0f')
+        self.ax2 = self.fig.add_subplot(212, facecolor='#0f0f0f')
+        
+        for ax, ylabel, title in [
+            (self.ax1, 'Critical Elements', 'CONVERGENCE'),
+            (self.ax2, 'Mass (kg)', 'MASS')
+        ]:
+            ax.set_xlabel('Iteration', color='#888888', fontsize=9, family='monospace')
+            ax.set_ylabel(ylabel, color='#888888', fontsize=9, family='monospace')
+            ax.set_title(title, color='#ff8800', fontweight='bold', fontsize=10, family='monospace')
+            ax.grid(True, alpha=0.15, color='#444444', linestyle='-', linewidth=0.5)
+            ax.tick_params(colors='#666666', labelsize=8)
+            ax.spines['bottom'].set_color('#ff6600')
+            ax.spines['top'].set_color('#444444')
+            ax.spines['left'].set_color('#ff6600')
+            ax.spines['right'].set_color('#444444')
+            ax.set_facecolor('#0f0f0f')
+        
+        self.fig.tight_layout(pad=2.0)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        QVBoxLayout(widget).addWidget(self.canvas)
+        
+        return widget
+    
+    def save_results(self, work_dir: str, base: str, iteration: int,
+                    df_res: pd.DataFrame, updated_pids: Set[int]) -> str:
+        """Save optimization results to Excel file"""
+        res_file = os.path.join(work_dir, f"{base}_RESULTS.xlsx")
+        
+        algo_name = "Lazy (Iterative)" if self.algo_lazy_radio.isChecked() else "Gaussian Process"
+        prop_method = "Neighbor Approach" if self.prop_neighbor_radio.isChecked() else "Manual IDs"
+        
+        target_rf = self.target_rf.value()
+        n_crit_final = len(df_res[df_res['RF'] < target_rf])
+        converged = (n_crit_final == 0)
+        
+        final_mass = None
+        if self.iteration_data and self.iteration_data[-1].get('mass'):
+            final_mass = self.iteration_data[-1]['mass']
+        
+        mass_change_str = "N/A"
+        if self.initial_mass and final_mass:
+            mass_change_pct = ((final_mass - self.initial_mass) / self.initial_mass) * 100
+            mass_change_str = f"{mass_change_pct:+.2f}%"
+        
+        df_sum = pd.DataFrame({
+            'Parameter': [
+                'Algorithm',
+                'Property Selection',
+                'Status',
+                'Converged',
+                'Total Iterations',
+                'Critical Elements (Final)',
+                'Target RF',
+                'Initial Mass',
+                'Final Mass',
+                'Mass Change',
+                'Thickness Addition (Lazy)',
+                'Angle Tolerance',
+                'Properties Modified',
+                'Modified Property IDs'
+            ],
+            'Value': [
+                algo_name,
+                prop_method,
+                'Complete' if converged else 'Max Iterations Reached',
+                'Yes' if converged else 'No',
+                iteration,
+                n_crit_final,
+                f"{target_rf:.2f}",
+                f"{self.initial_mass:.2f} kg" if self.initial_mass else "N/A",
+                f"{final_mass:.2f} kg" if final_mass else "N/A",
+                mass_change_str,
+                f"{self.thickness_addition.value():.3f} mm" if self.algo_lazy_radio.isChecked() else "N/A",
+                f"{self.angle_tolerance:.1f}°",
+                len(updated_pids),
+                ', '.join(map(str, sorted(list(updated_pids))[:20])) + 
+                    ('...' if len(updated_pids) > 20 else '')
+            ]
+        })
+        
+        df_hist = pd.DataFrame([{
+            'Iteration': d['iteration'],
+            'Critical_Elements': d['critical_count'],
+            'Min_RF': min(d['rf_values']) if d['rf_values'] else None,
+            'Max_RF': max(d['rf_values']) if d['rf_values'] else None,
+            'Avg_RF': np.mean(d['rf_values']) if d['rf_values'] else None,
+            'Std_RF': np.std(d['rf_values']) if d['rf_values'] else None,
+            'Mass_kg': d.get('mass')} for d in self.iteration_data])
+           
+        
+        df_crit_final = df_res[df_res['RF'] < target_rf].copy()
+    
+        with pd.ExcelWriter(res_file, engine='openpyxl') as writer:
+            df_sum.to_excel(writer, sheet_name='Summary', index=False)
+            df_hist.to_excel(writer, sheet_name='History', index=False)
+            df_res.to_excel(writer, sheet_name='All_Elements', index=False)
+            df_crit_final.to_excel(writer, sheet_name='Critical_Elements', index=False)
+            
+            for sheet_name in writer.sheets:
+                worksheet = writer.sheets[sheet_name]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        self.log(f"<span style='color:#81c784'>Results saved: {res_file}</span>")
+        return res_file
+    
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PCOMPOptimizerGUI()
+    window.showMaximized()
+    window.show()
+    sys.exit(app.exec_())
