@@ -1,0 +1,392 @@
+"""
+Thermal Mapper - Maps temperature loads between BDF structures
+Supports two methods: Absolute Proximity and Inverse Distance Weighting
+"""
+
+from pyNastran.bdf.bdf import read_bdf, BDF
+import os
+import numpy as np
+from scipy.spatial import cKDTree
+import time
+
+def read_temperature_files(temp_folder, source_bdf):
+    """
+    Read all TEMP*.bdf files from folder and organize by temp_id
+    
+    Returns:
+        dict: {temp_id: {node_id: {'coord': xyz, 'temp': value}}}
+    """
+    storage = {}
+    temp_files = [f for f in os.listdir(temp_folder) 
+                  if f.lower().endswith('.bdf') and 'temp' in f.lower()]
+    
+    print(f"Reading {len(temp_files)} temperature files from {temp_folder}...")
+    
+    for file in temp_files:
+        filepath = os.path.join(temp_folder, file)
+        with open(filepath, 'r') as fin:
+            for line in fin.readlines():
+                if not line.strip() or line.startswith('$'):
+                    continue
+                
+                try:
+                    temp_id = int(line[8:16])
+                    node_id = int(line[16:24])
+                    temp = float(line[24:32])
+                    xyz = source_bdf.nodes[node_id].xyz
+                    
+                    if temp_id not in storage:
+                        storage[temp_id] = {}
+                    
+                    storage[temp_id][node_id] = {
+                        'coord': np.array(xyz), 
+                        'temp': temp
+                    }
+                except (ValueError, KeyError, IndexError):
+                    continue  # Skip malformed lines
+    
+    print(f"  Found {len(storage)} unique temperature load cases")
+    for temp_id in sorted(storage.keys()):
+        print(f"    temp_id {temp_id}: {len(storage[temp_id])} nodes")
+    
+    return storage
+
+
+def map_temperatures_proximity(source_storage, target_bdf, tolerance=1.0, epsilon=1e-6, debug=False):
+    """
+    Map temperatures using absolute proximity method
+    
+    If one node is closest: use its exact temperature
+    If multiple nodes are equidistant: average their temperatures
+    
+    Args:
+        source_storage: Dictionary from read_temperature_files
+        target_bdf: Target BDF structure
+        tolerance: Maximum distance for valid mapping
+        epsilon: Tolerance for considering distances equal
+        debug: If True, print unmapped node distances
+        
+    Returns:
+        dict: {temp_id: {target_node_id: temperature}}
+    """
+    print("\n" + "="*70)
+    print("METHOD: ABSOLUTE PROXIMITY")
+    print("="*70)
+    
+    target_nids = list(target_bdf.nodes.keys())
+    target_coords = np.array([target_bdf.nodes[nid].xyz for nid in target_nids])
+    
+    mapped_temps = {}
+    
+    # Add small buffer to tolerance to handle floating point precision
+    search_tolerance = tolerance * 1.001  # 0.1% buffer
+    
+    for temp_id, source_nodes in source_storage.items():
+        print(f"\nProcessing temp_id {temp_id}...")
+        
+        # Extract source data
+        source_nids = list(source_nodes.keys())
+        source_coords = np.array([source_nodes[nid]['coord'] for nid in source_nids])
+        source_temps = np.array([source_nodes[nid]['temp'] for nid in source_nids])
+        
+        # Build KDTree
+        tree = cKDTree(source_coords)
+        
+        # Query multiple neighbors to detect ties
+        k = min(10, len(source_coords))
+        distances, indices = tree.query(target_coords, k=k, 
+                                       distance_upper_bound=search_tolerance)
+        
+        # Map temperatures
+        mapped_temps[temp_id] = {}
+        exact_matches = 0
+        averaged_matches = 0
+        unmapped = 0
+        unmapped_details = []
+        
+        for i, target_nid in enumerate(target_nids):
+            # Filter valid results and apply strict tolerance check
+            valid_mask = (distances[i] != np.inf) & (distances[i] <= tolerance)
+            if not np.any(valid_mask):
+                unmapped += 1
+                if debug:
+                    # Find actual minimum distance for debugging
+                    all_distances = np.linalg.norm(source_coords - target_coords[i], axis=1)
+                    min_actual = np.min(all_distances)
+                    unmapped_details.append((target_nid, min_actual))
+                continue
+            
+            valid_distances = distances[i][valid_mask]
+            valid_indices = indices[i][valid_mask]
+            
+            min_dist = valid_distances[0]
+            
+            # Find all nodes at minimum distance
+            tie_mask = np.abs(valid_distances - min_dist) < epsilon
+            tied_indices = valid_indices[tie_mask]
+            tied_temps = source_temps[tied_indices]
+            
+            if len(tied_indices) == 1:
+                # Single closest node - exact temperature
+                mapped_temps[temp_id][target_nid] = float(tied_temps[0])
+                exact_matches += 1
+            else:
+                # Multiple equidistant nodes - average
+                mapped_temps[temp_id][target_nid] = float(np.mean(tied_temps))
+                averaged_matches += 1
+        
+        # Report statistics
+        total_mapped = len(mapped_temps[temp_id])
+        coverage = total_mapped / len(target_nids) * 100
+        print(f"  Results:")
+        print(f"    Mapped:          {total_mapped}/{len(target_nids)} nodes ({coverage:.1f}%)")
+        print(f"    Exact matches:   {exact_matches}")
+        print(f"    Averaged (ties): {averaged_matches}")
+        print(f"    Unmapped:        {unmapped}")
+        
+        if debug and unmapped_details:
+            print(f"\n  Unmapped node details (showing first 10):")
+            for nid, dist in sorted(unmapped_details, key=lambda x: x[1])[:10]:
+                print(f"    Node {nid}: nearest source at distance {dist:.6f}")
+    
+    return mapped_temps
+
+
+def map_temperatures_idw(source_storage, target_bdf, tolerance=1.0, 
+                        n_neighbors=3, power=2, debug=False):
+    """
+    Map temperatures using Inverse Distance Weighting (IDW)
+    
+    Uses weighted average of nearest neighbors based on inverse distance
+    
+    Args:
+        source_storage: Dictionary from read_temperature_files
+        target_bdf: Target BDF structure
+        tolerance: Maximum distance for valid mapping
+        n_neighbors: Number of neighbors to use for interpolation
+        power: Power parameter for distance weighting (default=2)
+        debug: If True, print unmapped node distances
+        
+    Returns:
+        dict: {temp_id: {target_node_id: temperature}}
+    """
+    print("\n" + "="*70)
+    print("METHOD: INVERSE DISTANCE WEIGHTING (IDW)")
+    print(f"Parameters: n_neighbors={n_neighbors}, power={power}")
+    print("="*70)
+    
+    target_nids = list(target_bdf.nodes.keys())
+    target_coords = np.array([target_bdf.nodes[nid].xyz for nid in target_nids])
+    
+    mapped_temps = {}
+    epsilon = 1e-6
+    
+    # Add small buffer to tolerance
+    search_tolerance = tolerance * 1.001
+    
+    for temp_id, source_nodes in source_storage.items():
+        print(f"\nProcessing temp_id {temp_id}...")
+        
+        # Extract source data
+        source_nids = list(source_nodes.keys())
+        source_coords = np.array([source_nodes[nid]['coord'] for nid in source_nids])
+        source_temps = np.array([source_nodes[nid]['temp'] for nid in source_nids])
+        
+        # Build KDTree
+        tree = cKDTree(source_coords)
+        
+        # Query neighbors for IDW
+        k = min(n_neighbors, len(source_coords))
+        distances, indices = tree.query(target_coords, k=k, 
+                                       distance_upper_bound=search_tolerance)
+        
+        # Map temperatures using IDW
+        mapped_temps[temp_id] = {}
+        exact_matches = 0
+        interpolated = 0
+        unmapped = 0
+        unmapped_details = []
+        
+        for i, target_nid in enumerate(target_nids):
+            # Filter valid results and apply strict tolerance
+            if k == 1:
+                if distances[i] != np.inf and distances[i] <= tolerance:
+                    mapped_temps[temp_id][target_nid] = float(source_temps[indices[i]])
+                    exact_matches += 1
+                else:
+                    unmapped += 1
+                    if debug:
+                        all_distances = np.linalg.norm(source_coords - target_coords[i], axis=1)
+                        min_actual = np.min(all_distances)
+                        unmapped_details.append((target_nid, min_actual))
+                continue
+            
+            valid_mask = (distances[i] != np.inf) & (distances[i] <= tolerance)
+            if not np.any(valid_mask):
+                unmapped += 1
+                if debug:
+                    all_distances = np.linalg.norm(source_coords - target_coords[i], axis=1)
+                    min_actual = np.min(all_distances)
+                    unmapped_details.append((target_nid, min_actual))
+                continue
+            
+            valid_distances = distances[i][valid_mask]
+            valid_indices = indices[i][valid_mask]
+            valid_temps = source_temps[valid_indices]
+            
+            # Check for exact match (distance ≈ 0)
+            if valid_distances[0] < epsilon:
+                # Use exact match or average of coincident nodes
+                exact_mask = valid_distances < epsilon
+                mapped_temps[temp_id][target_nid] = float(np.mean(valid_temps[exact_mask]))
+                exact_matches += 1
+            else:
+                # Inverse distance weighting
+                weights = 1.0 / valid_distances**power
+                weighted_temp = np.sum(weights * valid_temps) / np.sum(weights)
+                mapped_temps[temp_id][target_nid] = float(weighted_temp)
+                interpolated += 1
+        
+        # Report statistics
+        total_mapped = len(mapped_temps[temp_id])
+        coverage = total_mapped / len(target_nids) * 100
+        print(f"  Results:")
+        print(f"    Mapped:       {total_mapped}/{len(target_nids)} nodes ({coverage:.1f}%)")
+        print(f"    Exact:        {exact_matches}")
+        print(f"    Interpolated: {interpolated}")
+        print(f"    Unmapped:     {unmapped}")
+        
+        if debug and unmapped_details:
+            print(f"\n  Unmapped node details (showing first 10):")
+            for nid, dist in sorted(unmapped_details, key=lambda x: x[1])[:10]:
+                print(f"    Node {nid}: nearest source at distance {dist:.6f}")
+    
+    return mapped_temps
+
+
+def write_output_files(mapped_temps, output_folder, method_suffix=""):
+    """
+    Write mapped temperatures to BDF files
+    
+    Args:
+        mapped_temps: Dictionary from mapping function
+        output_folder: Output directory path
+        method_suffix: Suffix to add to filename (e.g., "_proximity")
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    
+    print("\n" + "="*70)
+    print("WRITING OUTPUT FILES")
+    print("="*70)
+    
+    for temp_id, temperatures in mapped_temps.items():
+        if temperatures:
+            output_bdf = BDF()
+            output_bdf.add_temp(sid=temp_id, temperatures=temperatures)
+            
+            output_filename = f'target_temp_{temp_id}{method_suffix}.bdf'
+            output_path = os.path.join(output_folder, output_filename)
+            output_bdf.write_bdf(output_path, size=8, is_double=False)
+            print(f"  Created: {output_filename} ({len(temperatures)} nodes)")
+        else:
+            print(f"  Warning: No nodes mapped for temp_id {temp_id}")
+
+
+def thermal_mapper(source_bdf_path, temp_folder, target_bdf_path, 
+                   output_folder, method='proximity', tolerance=1.0, 
+                   n_neighbors=3, power=2, debug=False):
+    """
+    Main function to map thermal loads between BDF structures
+    
+    Args:
+        source_bdf_path: Path to source structure BDF
+        temp_folder: Folder containing TEMP*.bdf files
+        target_bdf_path: Path to target structure BDF
+        output_folder: Output folder for mapped temperature files
+        method: 'proximity' or 'idw'
+        tolerance: Maximum distance for mapping
+        n_neighbors: Number of neighbors for IDW (only used if method='idw')
+        power: Power parameter for IDW (only used if method='idw')
+        debug: If True, show details of unmapped nodes
+    """
+    print("\n" + "="*70)
+    print("THERMAL MAPPER - BDF TEMPERATURE MAPPING")
+    print("="*70)
+    print(f"Source BDF:   {source_bdf_path}")
+    print(f"Temp Folder:  {temp_folder}")
+    print(f"Target BDF:   {target_bdf_path}")
+    print(f"Output:       {output_folder}")
+    print(f"Method:       {method.upper()}")
+    print(f"Tolerance:    {tolerance}")
+    if debug:
+        print(f"Debug:        ENABLED")
+    
+    # Read BDF files
+    print("\n" + "-"*70)
+    print("LOADING BDF STRUCTURES")
+    print("-"*70)
+    print("Reading source BDF...")
+    source_bdf = read_bdf(source_bdf_path, punch=True, xref=False)
+    print(f"  Source nodes: {len(source_bdf.nodes)}")
+    
+    print("Reading target BDF...")
+    target_bdf = read_bdf(target_bdf_path, punch=True, xref=False)
+    print(f"  Target nodes: {len(target_bdf.nodes)}")
+    
+    # Read temperature files
+    print("\n" + "-"*70)
+    print("LOADING TEMPERATURE DATA")
+    print("-"*70)
+    source_storage = read_temperature_files(temp_folder, source_bdf)
+    
+    # Map temperatures based on selected method
+    if method.lower() == 'proximity':
+        mapped_temps = map_temperatures_proximity(source_storage, target_bdf, 
+                                                 tolerance=tolerance, debug=debug)
+        method_suffix = "_proximity"
+    elif method.lower() == 'idw':
+        mapped_temps = map_temperatures_idw(source_storage, target_bdf, 
+                                           tolerance=tolerance,
+                                           n_neighbors=n_neighbors, 
+                                           power=power, debug=debug)
+        method_suffix = "_idw"
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'proximity' or 'idw'")
+    
+    # Write output files
+    write_output_files(mapped_temps, output_folder, method_suffix)
+    
+    print("\n" + "="*70)
+    print("MAPPING COMPLETE!")
+    print("="*70)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example with proximity method and debug enabled
+    start=time.time()
+    
+    thermal_mapper(
+        source_bdf_path='source_stru.bdf',
+        temp_folder=r'C:\Users\User\Desktop\VSCODE\34_thermal_mapper',
+        target_bdf_path='target_stru.bdf',
+        output_folder='output',
+        method='proximity',
+        tolerance=6,
+        debug=True 
+    )
+    
+    end=time.time()
+    print(end-start)
+    # Example with IDW method
+    # thermal_mapper(
+    #     source_bdf_path='source_stru.bdf',
+    #     temp_folder='temp_files',
+    #     target_bdf_path='target_stru.bdf',
+    #     output_folder='output',
+    #     method='idw',
+    #     tolerance=6.0,
+    #     n_neighbors=3,
+    #     power=2,
+    #     debug=True
+    # )
