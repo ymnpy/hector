@@ -1,0 +1,265 @@
+from pyNastran.bdf.bdf import read_bdf, BDF
+from pyNastran.bdf.mesh_utils import free_edges
+from scipy.spatial import KDTree
+import numpy as np
+
+# Read BDF files
+source_path = r'C:/Users/User/Desktop/VSCODE/35_force_mapper/1.bdf'
+source_bdf = read_bdf(source_path)
+target_path = r'C:/Users/User/Desktop/VSCODE/35_force_mapper/2.bdf'
+target_bdf = read_bdf(target_path)
+
+# Get free edges from target
+target_free_edges = free_edges.non_paired_edges(target_bdf)
+target_free_nodes = sorted(set(nid for edge in target_free_edges for nid in edge))
+
+print(f"Target: {len(target_free_nodes)} free nodes, {len(target_free_edges)} free edges")
+
+# Get target coordinates
+target_coords = np.array([target_bdf.nodes[nid].get_position() for nid in target_free_nodes])
+
+# Build KDTree for target free nodes
+target_tree = KDTree(target_coords)
+
+# Calculate influence radius based on target mesh density
+edge_lengths = []
+for edge in target_free_edges[:100]:  # Sample first 100 edges
+    n1, n2 = edge[0], edge[1]
+    p1 = target_bdf.nodes[n1].get_position()
+    p2 = target_bdf.nodes[n2].get_position()
+    edge_lengths.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+avg_edge_length = np.mean(edge_lengths) if edge_lengths else 1.0
+influence_radius = avg_edge_length * 3.0  # Adjust multiplier as needed
+print(f"Average edge length: {avg_edge_length:.4f}")
+print(f"Influence radius for RBE3: {influence_radius:.4f}")
+
+# Extract forces and moments from source BDF
+forces = {}  # {node_id: [fx, fy, fz]}
+moments = {}  # {node_id: [mx, my, mz]}
+
+for load_id, load_cards in source_bdf.loads.items():
+    if not isinstance(load_cards, list):
+        load_cards = [load_cards]
+    
+    for load_card in load_cards:
+        card_type = load_card.type
+        
+        if card_type == 'FORCE':
+            nid = load_card.node
+            mag = load_card.mag
+            xyz = load_card.xyz
+            force_vector = mag * np.array(xyz)
+            if nid not in forces:
+                forces[nid] = np.zeros(3)
+            forces[nid] += force_vector
+        
+        elif card_type == 'MOMENT':
+            nid = load_card.node
+            mag = load_card.mag
+            xyz = load_card.xyz
+            moment_vector = mag * np.array(xyz)
+            if nid not in moments:
+                moments[nid] = np.zeros(3)
+            moments[nid] += moment_vector
+
+print(f"Found {len(forces)} force nodes and {len(moments)} moment nodes in source BDF")
+
+# Create output BDF
+output_bdf = BDF()
+rbe3_id = max(target_bdf.elements.keys()) + 1 if target_bdf.elements else 1
+load_set_id = 1
+
+mapped_forces = []
+mapped_moments = []
+
+# Map forces with radius-based RBE3
+for src_nid, force_vec in forces.items():
+    if src_nid not in source_bdf.nodes:
+        continue
+    
+    src_coord = source_bdf.nodes[src_nid].get_position()
+    
+    # Find all target nodes within influence radius
+    indices = target_tree.query_ball_point(src_coord, r=influence_radius)
+    
+    if not indices:
+        # Fallback: use nearest node if nothing within radius
+        dist, idx = target_tree.query(src_coord, k=1)
+        indices = [idx]
+    
+    # Get nodes and distances
+    nearby_node_ids = [target_free_nodes[i] for i in indices]
+    distances = [np.linalg.norm(target_coords[i] - src_coord) for i in indices]
+    
+    # Calculate inverse distance weights
+    weights = 1.0 / (np.array(distances) + 1e-10)
+    weights = weights / weights.sum()
+    
+    # Create reference node (closest node)
+    closest_idx = np.argmin(distances)
+    ref_grid = nearby_node_ids[closest_idx]
+    
+    # Check geometry to determine if nodes are collinear/coplanar
+    use_rotations = False
+    if len(nearby_node_ids) >= 3:
+        # Get positions of nodes
+        positions = np.array([target_bdf.nodes[nid].get_position() for nid in nearby_node_ids])
+        
+        # Check if nodes span 3D space (not collinear/coplanar)
+        centered = positions - positions.mean(axis=0)
+        if len(centered) >= 3:
+            # Calculate covariance matrix
+            cov = np.dot(centered.T, centered) / len(centered)
+            eigenvalues = np.linalg.eigvalsh(cov)
+            
+            # If all 3 eigenvalues are significant, nodes span 3D space
+            # This means rotations can be constrained
+            if eigenvalues[0] > 1e-6 * eigenvalues[2]:
+                use_rotations = True
+    
+    # Create RBE3 element connecting all nearby nodes
+    if len(nearby_node_ids) > 1:
+        if use_rotations:
+            # Nodes span 3D space - use all 6 DOFs
+            output_bdf.add_rbe3(
+                eid=rbe3_id,
+                refgrid=ref_grid,
+                refc='123456',
+                weights=weights.tolist(),
+                comps=['123456'] * len(nearby_node_ids),
+                Gijs=nearby_node_ids
+            )
+        else:
+            # Nodes are collinear/coplanar - use only translations
+            output_bdf.add_rbe3(
+                eid=rbe3_id,
+                refgrid=ref_grid,
+                refc='123',
+                weights=weights.tolist(),
+                comps=['123'] * len(nearby_node_ids),
+                Gijs=nearby_node_ids
+            )
+        rbe3_id += 1
+    
+    # Add force at reference grid
+    force_mag = np.linalg.norm(force_vec)
+    if force_mag > 1e-10:
+        output_bdf.add_force(
+            sid=load_set_id,
+            node=ref_grid,
+            mag=force_mag,
+            xyz=(force_vec / force_mag).tolist()
+        )
+    
+    mapped_forces.append((src_nid, ref_grid, len(nearby_node_ids)))
+
+# Map moments with radius-based RBE3
+for src_nid, moment_vec in moments.items():
+    if src_nid not in source_bdf.nodes:
+        continue
+    
+    src_coord = source_bdf.nodes[src_nid].get_position()
+    
+    # Find all target nodes within influence radius
+    indices = target_tree.query_ball_point(src_coord, r=influence_radius)
+    
+    if not indices:
+        # Fallback: use nearest node if nothing within radius
+        dist, idx = target_tree.query(src_coord, k=1)
+        indices = [idx]
+    
+    # Get nodes and distances
+    nearby_node_ids = [target_free_nodes[i] for i in indices]
+    distances = [np.linalg.norm(target_coords[i] - src_coord) for i in indices]
+    
+    # Calculate inverse distance weights
+    weights = 1.0 / (np.array(distances) + 1e-10)
+    weights = weights / weights.sum()
+    
+    # Create reference node (closest node)
+    closest_idx = np.argmin(distances)
+    ref_grid = nearby_node_ids[closest_idx]
+    
+    # Check geometry to determine if nodes are collinear/coplanar
+    use_rotations = False
+    if len(nearby_node_ids) >= 3:
+        # Get positions of nodes
+        positions = np.array([target_bdf.nodes[nid].get_position() for nid in nearby_node_ids])
+        
+        # Check if nodes span 3D space (not collinear/coplanar)
+        centered = positions - positions.mean(axis=0)
+        if len(centered) >= 3:
+            # Calculate covariance matrix
+            cov = np.dot(centered.T, centered) / len(centered)
+            eigenvalues = np.linalg.eigvalsh(cov)
+            
+            # If all 3 eigenvalues are significant, nodes span 3D space
+            # This means rotations can be constrained
+            if eigenvalues[0] > 1e-6 * eigenvalues[2]:
+                use_rotations = True
+    
+    # Create RBE3 element connecting all nearby nodes
+    if len(nearby_node_ids) > 1:
+        if use_rotations:
+            # Nodes span 3D space - use all 6 DOFs
+            output_bdf.add_rbe3(
+                eid=rbe3_id,
+                refgrid=ref_grid,
+                refc='123456',
+                weights=weights.tolist(),
+                comps=['123456'] * len(nearby_node_ids),
+                Gijs=nearby_node_ids
+            )
+        else:
+            # Nodes are collinear/coplanar - use only translations
+            output_bdf.add_rbe3(
+                eid=rbe3_id,
+                refgrid=ref_grid,
+                refc='123',
+                weights=weights.tolist(),
+                comps=['123'] * len(nearby_node_ids),
+                Gijs=nearby_node_ids
+            )
+        rbe3_id += 1
+    
+    # Add moment at reference grid
+    moment_mag = np.linalg.norm(moment_vec)
+    if moment_mag > 1e-10:
+        output_bdf.add_moment(
+            sid=load_set_id,
+            node=ref_grid,
+            mag=moment_mag,
+            xyz=(moment_vec / moment_mag).tolist()
+        )
+    
+    mapped_moments.append((src_nid, ref_grid, len(nearby_node_ids)))
+
+# Write output
+output_path = r'C:/Users/User/Desktop/VSCODE/35_force_mapper/mapped_loads.bdf'
+output_bdf.write_bdf(output_path)
+
+print(f"\nMapping complete:")
+print(f"- Mapped {len(mapped_forces)} forces")
+print(f"- Mapped {len(mapped_moments)} moments")
+print(f"- Created {rbe3_id - (max(target_bdf.elements.keys()) + 1 if target_bdf.elements else 1)} RBE3 elements")
+print(f"- Output written to: {output_path}")
+
+# Statistics on node distribution
+if mapped_forces:
+    force_node_counts = [count for _, _, count in mapped_forces]
+    print(f"\nForce RBE3 statistics:")
+    print(f"  Average nodes per RBE3: {np.mean(force_node_counts):.1f}")
+    print(f"  Min nodes: {min(force_node_counts)}, Max nodes: {max(force_node_counts)}")
+
+if mapped_moments:
+    moment_node_counts = [count for _, _, count in mapped_moments]
+    print(f"\nMoment RBE3 statistics:")
+    print(f"  Average nodes per RBE3: {np.mean(moment_node_counts):.1f}")
+    print(f"  Min nodes: {min(moment_node_counts)}, Max nodes: {max(moment_node_counts)}")
+
+# Show sample mappings
+if mapped_forces:
+    print("\nSample force mappings (source node -> ref node [# of connected nodes]):")
+    for src, ref, count in mapped_forces[:5]:
+        print(f"  {src} -> {ref} [{count} nodes]")
