@@ -1,3 +1,7 @@
+#123 vs 123456 dof error
+#avoid same refgrid
+#avoid dep and indep same node
+
 from pyNastran.bdf.bdf import read_bdf, BDF
 from pyNastran.bdf.mesh_utils import free_edges
 from scipy.spatial import KDTree
