@@ -1,0 +1,878 @@
+import os, platform, psutil, getpass
+import subprocess
+import time
+import numpy as np
+import pandas as pd
+import xlwings as xw
+import plotly.graph_objects as go
+import plotly.io as pio
+from pyNastran.bdf.bdf import read_bdf
+from pyNastran.bdf.mesh_utils import free_edges
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def my_read_bdf(path):
+    try:
+        try: bdf=read_bdf(path,punch=True,xref=True)
+        except: bdf=read_bdf(path,punch=True,xref=False)
+    except:
+        try: bdf=read_bdf(path,punch=False,xref=True)
+        except: bdf=read_bdf(path,punch=False,xref=False)
+    return bdf
+
+
+def plot_free_edges(bdf):
+    """Plot lines connecting free edges in the mesh."""
+    free_nodes = free_edges.non_paired_edges(bdf)
+    x, y, z = [], [], []
+    
+    for node_pair in free_nodes:
+        for nid in node_pair:
+            node_coords = bdf.nodes[nid].xyz
+            x.append(node_coords[0])
+            y.append(node_coords[1])
+            z.append(node_coords[2])
+        # Add None to create breaks between line segments
+        x.append(None)
+        y.append(None)
+        z.append(None)
+    
+    return go.Scatter3d(x=x, y=y, z=z, mode='lines', 
+                        line=dict(color="gray", width=5), 
+                        showlegend=False, hoverinfo="none")
+
+def add_js(fig,output_name):
+    #DOES NOT WORK CONSISTENTLY, NEED TO MAKE SURE THAT IT WORKS
+    script="""
+    <script>
+        document.addEventListener('DOMContentLoaded',function()) {
+            var plotDiv = document.querySelector('.js-plotly-plot');
+            
+            if (plotDiv) {
+                plotDiv.on('plotly_click', function(data)) {
+                    if (data.event.shiftKey && data.points && data.points[0]) {
+                        var pt = data.points[0];
+                                
+                        Plotly.relayout(plotDiv, {
+                            'scene.camera.center': {
+                                x: pt.x,
+                                y: pt.y,
+                                z: pt.z
+                        }});
+                    }
+                }
+            }
+        }
+    
+    </script>
+    """
+    
+    # html_content=fig.to_html(include_plotlyjs=True, full_html=True)
+    html_content=fig.to_html()
+    final_html = html_content.replace('<body>', script + '</body>')
+    
+    return final_html
+
+    
+def label_trace(bdf,coords):
+    labels={"PID":[],"x":[],"y":[],"z":[],"text":[]}
+    
+    all_node_coords=[]
+    for elid in coords["ELID"]:
+        element=bdf.elements[elid]
+        for nid in element.nodes:
+            all_node_coords.append(np.array(bdf.nodes[nid.get_position()]))
+    
+    centroid=np.mean(all_node_coords,axis=0)
+    labels["x"].append(centroid[0])
+    labels["y"].append(centroid[1])
+    labels["z"].append(centroid[2])
+    
+    trace=go.Scatter3d(x=labels["x"],y=labels["y"],z=labels["z"],
+                       text=labels["text"],mode="markers+text",
+                       marker=dict(color="red",size=5),
+                       textposition="top center",
+                       textfont=dict(size=16,color="red",family="Comics Bold"),
+                       name="Property Labels",
+                       visible=True,
+                       customdata=labels["PID"],
+                       showlegend=False,
+                       hoverinfo="text")
+    return trace
+
+
+def project_onto(v, target):
+    """
+    this is for CBAR offsets,
+    v: offset vector wa,wb
+    target: normal vector of cbar
+    """
+    axis=np.array(target)
+    v=np.array(v)
+    axis_norm_sq=np.dot(axis,target)
+    return np.dot(v,axis)/axis_norm_sq*target
+    
+
+def offset_cbar_elements(bdf,element,offset_distance):
+    original_bars, left_offset_bars, right_offset_bars= [],[],[]
+    n1,n2=element.nodes
+    p1=np.array(bdf.nodes[n1].get_position())
+    p2=np.array(bdf.nodes[n2].get_position())
+    
+    bar_vector=p2-p1
+    bar_length=np.linalg.norm(bar_vector)
+    bar_unit=bar_vector/bar_length
+    
+    
+    if element.g0 is not None:
+        g0_coord=np.array(bdf.nodes[element.g0].get_position())
+        v_temp=g0_coord-p1
+    else:
+        v_temp=np.array(element.x)
+    
+    if element.wa is not None:
+        wa,wb = element.wa, element.wb
+    else:
+        print("WARNING - Offset values are not found, taking arbitrary values.")
+        wa,wb=np.array([0,0,0]),np.array([0,0,0])
+        
+    #make sure v_temp is not parallel to bar_unit
+    if np.isclose(np.abs(np.dot(v_temp/np.linalg.norm(v_temp),bar_unit)),1.0):
+        if not np.isclose(np.abs(bar_unit[0]),1.0):
+            v_temp=np.array([1,0,0])
+        else:
+            v_temp=np.array([0,1,0])
+    
+    y_axis = np.cross(bar_unit,v_temp)
+    y_axis = y_axis / np.linalg.norm(y_axis)
+    
+    z_axis = np.cross(bar_unit,y_axis)
+    z_axis = z_axis / np.linalg.norm(z_axis)
+    
+    '''
+    globalZ=np.array([0,0,1])
+    sim_y_globalZ=np.dot(y_axis,globalZ)/(np.linalg.norm(y_axis) * np.linalg.norm(globalZ))
+    sim_z_globalZ=np.dot(z_axis,globalZ)/(np.linalg.norm(z_axis) * np.linalg.norm(globalZ))
+    
+    if sim_y_globalZ>sim_z_globalZ:
+        y_axis=z_axis
+    '''
+    y_axis=z_axis
+    wa=project_onto(wa,y_axis)
+    wb=project_onto(wa,y_axis)
+    
+    left_p1=p1+y_axis*offset_distance + wa
+    left_p2=p2+y_axis*offset_distance + wb
+    
+    right_p1=p1-y_axis*offset_distance + wa
+    right_p2=p2-y_axis*offset_distance + wb
+    
+    original_bars.append((p1,p2))
+    left_offset_bars.append((left_p1,left_p2))
+    right_offset_bars.append((right_p1,right_p2))
+    
+    return original_bars, left_offset_bars, right_offset_bars
+
+
+# =============================================================================
+# FASTENER PLOT    
+# =============================================================================
+
+def plot_fastener_points(bdf,fastener_df):
+    # Create dictionaries to store data by diameter
+    diameter_data = {}
+    
+    # Track unique fastener types
+    fastener_types_set = set()
+    elements=fastener_df["Element ID (PBARL)"].to_list()
+    # elems=fastener_df["Property ID (PBARL)"].to_list()
+    
+    for elid in elements:
+        # try:
+        #     prop=bdf.properties[pid]
+        #     elements=pid2eid[pid]
+        # except:
+        #     continue
+        
+        pid=bdf.elements[elid].pid
+        if bdf.elements[elid].type == "CBAR":
+            # Get fastener info
+            fastener_info = fastener_df[fastener_df["Element ID (PBARL)"] == elid]
+            fastener_type = fastener_info["Pin"].values[0]
+            diameter = float(fastener_info["Diameter"].values[0])
+            
+            # Track fastener type
+            fastener_types_set.add(fastener_type)
+            
+            # Initialize data structure for this diameter if needed
+            if diameter not in diameter_data:
+                diameter_data[diameter] = {}
+            
+            # Initialize data structure for this fastener type if needed
+            if fastener_type not in diameter_data[diameter]:
+                diameter_data[diameter][fastener_type] = {
+                    "x": [], "y": [], "z": [], "pids": [], "elids":[]
+                }
+            
+        # Calculate centroid for element
+            # valid_nodes = [node for node in bdf.elements[elid].nodes if node is not None]
+            valid_nodes=bdf.elements[elid].nodes
+            if valid_nodes:
+                x = sum(bdf.nodes[nid].xyz[0] for nid in valid_nodes) / len(valid_nodes)
+                y = sum(bdf.nodes[nid].xyz[1] for nid in valid_nodes) / len(valid_nodes)
+                z = sum(bdf.nodes[nid].xyz[2] for nid in valid_nodes) / len(valid_nodes)
+                
+                diameter_data[diameter][fastener_type]["x"].append(x)
+                diameter_data[diameter][fastener_type]["y"].append(y)
+                diameter_data[diameter][fastener_type]["z"].append(z)
+                diameter_data[diameter][fastener_type]["pids"].append(pid)
+                diameter_data[diameter][fastener_type]["elids"].append(elid)
+    
+    traces = []
+    
+    # Color map for different diameters
+    colors = {
+        4.17: "blue",
+        4.78: "cyan",
+        6.35: "lime",
+        7.92: "darkgreen",
+        9.53: "yellow",
+        11.13: "orange",
+        12.7: "red",
+        14.3: "magenta",
+        # Add more as needed
+    }
+    
+    # Symbol map for different fastener types
+    symbols = ['circle', 'square', 'x', 'diamond',
+    'diamond-open', 'circle-open', 'square-open', 'cross']
+    symbol_map = {}
+    
+    # Assign a different symbol to each fastener type
+    for i, fastener_type in enumerate(sorted(fastener_types_set)):
+        symbol_map[fastener_type] = symbols[i % len(symbols)]
+    
+    # print(f"Symbol mapping: {symbol_map}")
+    
+    for diameter, type_data in diameter_data.items():
+        for fastener_type, data in type_data.items():
+            if not data["x"]:  # Skip if no points
+                continue
+                
+            trace = go.Scatter3d(
+                x=data["x"],
+                y=data["y"],
+                z=data["z"],
+                mode='markers',
+                marker=dict(
+                    size=diameter,  # Use diameter for size
+                    color=colors.get(diameter, "gray"),
+                    symbol=symbol_map[fastener_type],  # Use assigned symbol
+                    opacity=1,
+                    line=dict(width=1, color='rgba(0, 0, 0, 0.5)')
+                ),
+                name=f'Ø{diameter}mm ({fastener_type})',
+                hovertemplate='<i>PBARL %{text}</i><br>Type: ' + fastener_type + '<br>Diameter: ' + str(diameter) + ' mm<extra></extra>',
+                text=data["pids"],
+                hoverinfo='none'  # This removes the default hover text
+            )
+            traces.append(trace)
+    
+    return traces
+
+
+def fplot(bdf_file,excel_file):
+    print("\nPLOTTING the TTB_fastener...\n")
+    bdf=my_read_bdf(bdf_file)
+    bdf_name=os.path.basename(bdf_file)
+    pid2eid=bdf.get_property_id_to_element_ids_map()
+    fastener_df=pd.read_excel(excel_file,sheet_name="JOINT")
+    
+    # Generate edge trace
+    edge_trace = plot_free_edges(bdf)
+
+    # Generate fastener traces
+    fastener_traces = plot_fastener_points(bdf,fastener_df)
+
+    # Combine all traces
+    all_traces = [edge_trace] + fastener_traces
+
+    # Create figure with all traces
+    fig = go.Figure(data=all_traces)
+
+    # Update layout with bigger legend and title
+    fig.update_layout(
+        scene=dict(
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
+        ),
+        template="plotly_white",
+        legend=dict(
+            font=dict(size=16),  # Bigger font size for legend items
+            # itemsizing="constant",  # Makes the legend items consistent size
+            x=0.99,
+            y=1.0,
+        )
+    )
+    
+    fig.update_layout(updatemenus=[dict(
+      type="buttons",
+      direction="right",
+      active=0, #0,
+      showactive=True,
+      x=0.5,
+      y=0.0,
+      xanchor="center",
+      yanchor="bottom",
+      buttons=list(
+        [
+        dict(args=['template', pio.templates['plotly_white']], label="White Theme", method="relayout"),   
+        dict(args=['template', pio.templates['plotly_dark']], label="Black Theme", method="relayout")
+        ]
+      ), 
+      font=dict(color="black")
+    )]) #ilginctir ama bu virgül önemli
+    
+    
+    title=f"<b>{bdf_name}</b><br>Fastener representation"
+        
+    fig.update_layout(margin=dict(r=0,l=0,t=0,b=0),
+                      title_text=title,title_x=0.003,title_y=0.98)
+    
+    os.chdir(os.path.dirname(excel_file))
+    
+    try:
+        fig.write_html("TTB_fastener_plot.html",config={"displayModeBar":False})
+        return 0
+    except Exception as e:
+        print(f"ERROR F-Plot: {e}")
+        return 1
+    
+    # final_html = add_js(fig,"TTB_fastener_plot.html")
+    # with open("TTB_fastener_plot.html", 'w', encoding='utf-8') as f:
+        # f.write(final_html,config={"displayModeBar":False})
+        # f.write(final_html)
+        
+    return 0
+
+
+# =============================================================================
+# SUMMARY PLOT
+# =============================================================================
+
+def extract_mesh_data(df, bdf):
+    """Extract mesh data including nodes, faces, and all RF values dynamically."""
+    coords = {'PID':[],'ELID':[],'x': [], 'y': [], 'z': [],
+              'cx':[],'cy':[],'cz':[]}
+    
+    global pid_centroids
+    pid_centroids={}
+    node_id_to_idx={}
+    current_idx=0
+    
+    edges_xyz = {'x': [], 'y': [], 'z': []}
+    faces = {'i': [], 'j': [], 'k': []}
+    hover_texts = []
+    offset = 0
+    
+    df.rename(columns={"Min RF":"RF (min)", "RF min":"RF (min)", "RF min sized":"RF (min) sized"},inplace=True)
+    excluded_columns = ['Property ID','Default Failure','Optimized Failure']
+    
+    try:
+        df["Optimized Failur(E)"]=df["Optimized Failure"].astype('category').cat.codes
+        df["Default Failur(E)"]=df["Default Failure"].astype('category').cat.codes
+    except:
+        pass
+    
+    
+    # Get all columns except excluded ones
+    intensity_columns = [col for col in df.columns if col not in excluded_columns]
+    intensity_values = {col: [] for col in intensity_columns}
+    
+    for elid, element in bdf.elements.items():
+        # Get property data
+        pid = element.pid
+        row = df[df['Property ID'] == pid]
+        if row.empty:
+            continue
+        
+        #addition
+        coords['PID'].append(pid)
+        coords['ELID'].append(elid)
+        
+        # Extract data for row
+        rf_data = row.iloc[0]
+        
+        # Build hover info for all columns
+        hover_info = []
+        for col in df.columns:  # Include all columns in hover info
+            if col in row.columns and col not in ['Property ID', 'LCID', 'Default Failur(E)', 'Optimized Failur(E)']:
+                if col in ["RF (min)", "RF min"]:
+                    try: hover_info.append(f"<b>⚫</b><br>{col}: {rf_data[col]:0.2f}")
+                    except: hover_info.append(f"<b>⚫</b><br>{col}: {rf_data[col]}") #incase of string
+                else:
+                    try: hover_info.append(f"{col}: {rf_data[col]:0.2f}")
+                    except: hover_info.append(f"{col}: {rf_data[col]}") #incase of string
+            elif col=="Property ID":
+                hover_info.append(f"PID: {rf_data[col]:0.0f}")
+            elif col=="LCID":
+                try: hover_info.append(f"{col}: {rf_data[col]:0.0f}<br><b>⚫</b>")
+                except: hover_info.append(f"{col}: {rf_data[col]}<br><b>⚫</b>")
+                # hover_info.append(f"__________________________")
+                
+        hover_text = "<br>".join(hover_info)
+        
+        
+        # Add node coordinates
+            # Add element edges and faces
+        if element.type == 'CQUAD4':
+            for nid in element.nodes:
+                node_xyz = bdf.nodes[nid].xyz
+                coords['x'].append(node_xyz[0])
+                coords['y'].append(node_xyz[1])
+                coords['z'].append(node_xyz[2])
+                node_id_to_idx[nid]=current_idx
+                current_idx+=1
+                
+                # Store intensity values for each column
+                for col in intensity_columns:
+                    intensity_values[col].append(rf_data[col])
+                
+                hover_texts.append(hover_text)
+                if pid not in pid_centroids: pid_centroids[pid] = []
+                pid_centroids[pid].append(node_xyz)
+                
+            # Add quad edges
+            edges = [[offset, offset+1], [offset+1, offset+2], 
+                     [offset+2, offset+3], [offset+3, offset]]
+            
+            # Add quad faces (two triangles)
+            faces['i'].extend([offset, offset])
+            faces['j'].extend([offset+1, offset+2])
+            faces['k'].extend([offset+2, offset+3])
+            offset += 4
+                
+        elif element.type == 'CTRIA3':
+            for nid in element.nodes:
+                node_xyz = bdf.nodes[nid].xyz
+                coords['x'].append(node_xyz[0])
+                coords['y'].append(node_xyz[1])
+                coords['z'].append(node_xyz[2])
+                node_id_to_idx[nid]=current_idx
+                current_idx+=1
+                
+                # Store intensity values for each column
+                for col in intensity_columns:
+                    intensity_values[col].append(rf_data[col])
+                
+                hover_texts.append(hover_text)
+                pid_centroids.setdefault(pid,[]).append(node_xyz)
+                
+            # Add triangle edges
+            edges = [[offset, offset+1], [offset+1, offset+2], [offset+2, offset]]
+            
+            # Add triangle face
+            faces['i'].append(offset)
+            faces['j'].append(offset+1)
+            faces['k'].append(offset+2)
+            offset += 3
+            
+            
+        elif element.type == "CBAR":
+            try:
+                prop=bdf.properties[pid]
+                width=max(prop.dim)
+            except:
+                n1,n2=element.nodes
+                p1=np.array(bdf.nodes[n1].get_position())
+                p2=np.array(bdf.nodes[n2].get_position())
+                bar_length=np.linalg.norm(p2-p1)
+                width=bar_length*0.05
+            
+            original_bars,left_offset_bars,right_offset_bars = offset_cbar_elements(bdf,element,width/2)
+            
+            p1,p2=original_bars[0]
+            left_p1,left_p2=left_offset_bars[0]
+            right_p1,right_p2=right_offset_bars[0]
+            
+            all_points=[left_p1,right_p1,left_p2,right_p2]
+            for point in all_points:
+                coords["x"].append(point[0])
+                coords["y"].append(point[1])
+                coords["z"].append(point[2])
+                
+                # Store intensity values for each column
+                for col in intensity_columns:
+                    intensity_values[col].append(rf_data[col])
+                
+                hover_texts.append(hover_text)
+                pid_centroids.setdefault(pid,[]).append((point[0],point[1],point[2]))
+                
+            edges = [[offset, offset+1], [offset+1, offset+3], 
+                     [offset+3, offset+2], [offset+2, offset]]
+            
+            # Add quad faces (two triangles)
+            faces['i'].extend([offset, offset+1])
+            faces['j'].extend([offset+1, offset+3])
+            faces['k'].extend([offset+2, offset+2])
+            offset += 4
+                
+        # Store edges for plotting
+        for edge in edges:
+            for idx in range(2):
+                node_idx = edge[idx]
+                edges_xyz['x'].append(coords['x'][node_idx])
+                edges_xyz['y'].append(coords['y'][node_idx])
+                edges_xyz['z'].append(coords['z'][node_idx])
+            # Add None to create a break between edges
+            edges_xyz['x'].append(None)
+            edges_xyz['y'].append(None)
+            edges_xyz['z'].append(None)
+    
+    return coords, faces, edges_xyz, intensity_values, hover_texts, intensity_columns
+
+
+def create_mesh_visualization(df,coords, faces, edges_xyz, intensity_values, hover_texts, intensity_columns):
+    """Create mesh visualization with dynamically generated intensity meshes and buttons."""
+    mesh_traces = []
+    centroids={}
+    tickvals=None
+    
+    removed_ones=["SubcaseID","Subcase ID", "LCID"]
+    for i in removed_ones: 
+        try: intensity_columns.remove(i)
+        except: pass
+    
+    # Create a mesh for each intensity column - only the first one will be visible initially
+    for i, col in enumerate(intensity_columns):
+        reversed_ones=["t (mm) default","t (mm) optimized", "mass (kg) default", "mass (kg) optimized"]
+        discrete_ones=["RF (min)", "RF min", "RF (min) sized", "RF min sized"]
+        series=pd.to_numeric(pd.Series(intensity_values[col]),errors='coerce')
+        # colorscale="Rainbow" if col in reversed_ones else "Rainbow_r"
+        cmax=series.mean(skipna=True)
+        cmin=0
+        
+        colorbar_config=dict(
+            title=dict(text=col, side='right'),
+            len=0.82,
+            thickness=15,
+            x=1.02
+        )
+        
+        #-----------------------------------------
+        if col not in centroids:
+            centroids[col]={"cx":[],"cy":[],"cz":[],"t":[]}
+            for pid,coords_list in pid_centroids.items():
+                row=df[df["Property ID"]==pid]
+                intensity_row=row.iloc[0]
+                
+                coords_arr=np.array(coords_list)
+                centroids[col]["cx"].append(coords_arr[:,0].mean())
+                centroids[col]["cy"].append(coords_arr[:,1].mean())
+                centroids[col]["cz"].append(coords_arr[:,2].mean())
+                
+                try: centroids[col]["t"].append(f"{intensity_row[col]:0.2f}")
+                except: centroids[col]["t"].append(f"{intensity_row[col]}")
+                
+        #-----------------------------------------
+        
+        
+        if col in reversed_ones:
+            #rainbow
+            cmax=series.max(skipna=True)
+            colorscale=[[0,'gray'],
+                          [0.001,'gray'],
+                          [0.01,'blue'],
+                          [0.25,'cyan'],
+                          [0.5,'lime'],
+                          [0.75,'yellow'],
+                          [1,'red']]
+            
+            
+        elif col in discrete_ones:
+            cmax=2
+            colorscale=[[0,'gray'],
+                          [0.001,'gray'],
+                          [0.001,'magenta'],
+                          [0.25,'magenta'],
+                          [0.25,'red'],
+                          [0.5,'red'],
+                          [0.5,'orange'],
+                          [0.75,'orange'],
+                          [0.75,'blue'],
+                          [1,'blue']]
+            
+            # tickvals=[0,0.4,0.8,1.2,1.6,2.0]
+            
+        else:
+            #rainbow
+            colorscale=[[0,'gray'],
+                          [0.001,'gray'],
+                          [0.01,'red'],
+                          [0.25,'yellow'],
+                          [0.5,'lime'],
+                          [0.75,'cyan'],
+                          [1,'blue']]
+        
+        
+        mesh = [go.Mesh3d(
+            x=coords['x'], y=coords['y'], z=coords['z'],
+            i=faces['i'], j=faces['j'], k=faces['k'],
+            intensity=intensity_values[col],
+            colorscale=colorscale,
+            cmin=cmin,
+            cmax=cmax,
+            hoverlabel=dict(
+                bgcolor="rgba(0, 0, 55, 0.9)",
+                bordercolor="rgba(255, 255, 255, 0.8)",
+                font=dict(
+                    color="white",
+                    size=14,
+                    family="Segoe UI, Arial, sans-serif"
+                )),
+            
+            colorbar=colorbar_config,
+            opacity=1,
+            flatshading=True,
+            hovertemplate='%{text}',
+            text=hover_texts,
+            visible=(i == 0),  # Only first mesh is visible initially
+            showlegend=False,
+            name=""),
+        
+        
+            go.Scatter3d(
+                x=centroids[col]["cx"], y=centroids[col]["cy"], z=centroids[col]["cz"],
+                mode="text+markers",
+                text=centroids[col]["t"],
+                textfont=dict(size=11,color="black"),
+                marker=dict(color="black",symbol="diamond",size=4),
+                name="Labels ON/OFF",
+                showlegend=True,
+                hoverinfo="skip",
+                visible=(i==1),
+                textposition="top center",
+                )]
+            
+        mesh_traces.extend(mesh)
+        
+    # Create edges trace
+    edges_trace = go.Scatter3d(
+        x=edges_xyz['x'], y=edges_xyz['y'], z=edges_xyz['z'],
+        mode='lines',
+        line=dict(color='black', width=1),
+        hoverinfo="none",
+        showlegend=False,
+        name="edge_traces"
+    )
+    
+    
+    # Create buttons dynamically for each intensity column
+    buttons = []
+    for i, col in enumerate(intensity_columns):
+        visible = [False] * len(intensity_columns) * 2
+        visible[2*i] = True  # Make the current mesh visible
+        visible[2*i+1] = True  # Make the current mesh visible
+        visible.extend([True, True]) # Add fixed traces visibility (edges_trace and free_edges_trace)
+        
+        button = {
+            'label': f'📊 {col}',
+            'method': "update",
+            # 'args': [{"visible": visible}, {"title": col}]
+            'args': [{"visible": visible}]
+        }
+        buttons.append(button)
+    
+    
+    updatemenus = [{
+        'buttons': buttons,
+        'direction': 'down',
+        'showactive': True,
+        'x': 1.01,
+        'xanchor': "right",
+        'y': 0.989,
+        'yanchor': "top",
+        'font' : {'color': 'black'}
+    }]
+    
+    
+    return mesh_traces + [edges_trace], updatemenus
+
+
+def splot(bdf_file,excel_file):
+    """read TTB summary excel and plots 
+       3D mesh plot w plotly by also using pynastran"""
+    
+    # Load data
+    print("\nPLOTTING the TTB_summary...\n")
+    df = pd.read_excel(excel_file)
+    bdf_model = my_read_bdf(bdf_file)
+    
+    mass_default,mass_optimized="n/a","n/a"
+    if "mass (kg) default" in df.columns:
+        mass_default=df["mass (kg) default"].sum()
+    if "mass (kg) optimized" in df.columns:
+        mass_optimized=df["mass (kg) optimized"].sum()
+        
+    # total_mass=sum(mass[0].values())
+    # Extract mesh data with all columns except excluded ones
+    coords, faces, edges_xyz, intensity_values, hover_texts, intensity_columns = extract_mesh_data(df, bdf_model)
+    
+    # Create visualization with dynamic buttons
+    mesh_traces, updatemenus = create_mesh_visualization(df, coords, faces, edges_xyz, intensity_values, hover_texts, intensity_columns)
+    
+    # Add free edges
+    free_edges_trace = plot_free_edges(bdf_model)
+    
+    # Create figure
+    fig = go.Figure(data=mesh_traces + [free_edges_trace])
+    fig.update_layout(legend=dict(x=1.01,y=0.012,xanchor="right",yanchor="bottom", bordercolor="gray",borderwidth=1))
+    
+    
+    # mode1=[trace.mode for trace in fig.data]
+    mode1=[getattr(trace,"mode",None) for trace in fig.data]
+    mode2=['text' if trace.name=="edge_traces" and hasattr(trace,"mode") else getattr(trace,"mode", None) for trace in fig.data]
+                                    
+    updatemenus+=dict(
+        type="buttons",
+         direction="right",
+         active=0,
+         showactive=True,
+         xanchor="left",
+         yanchor="bottom",
+         x=0.059,
+         y=0.012,
+         buttons=[dict(
+                 label=" 💠 ",
+                 method="update",
+                 args=[{"mode":mode2}, 
+                       {"updatemenus[1].buttons[0].label":" 💠 ",
+                       "updatemenus[1].bordercolor":"gray"}],
+                 args2=[{"mode":mode1}, 
+                        {"updatemenus[1].buttons[0].label":" 💠 ",
+                         "updatemenus[1].bordercolor":"green"}])],
+         font=dict(color="black",size=10),
+         bordercolor="gray",
+         borderwidth=1
+      ),
+    
+    updatemenus+=dict(
+        type="buttons",
+        showactive=True,
+        active=1,
+        xanchor="left",
+        yanchor="bottom",
+        x=0.087,
+        y=0.012,
+        buttons=[dict(
+                label=" 👁‍🗨 ",
+                method="update",
+                args=[{"opacity":0.5}, 
+                      {"updatemenus[2].buttons[0].label":" 👁‍🗨 ",
+                      "updatemenus[2].bordercolor":"green"}],
+                args2=[{"opacity":1}, 
+                       {"updatemenus[2].buttons[0].label":" 👁‍🗨 ",
+                        "updatemenus[2].bordercolor":"gray"}])],           
+        font=dict(color="black",size=10),
+        bordercolor="gray",
+        borderwidth=1
+      ),
+    
+    updatemenus+=dict(
+      type="buttons",
+      active=0,
+      showactive=True,
+      xanchor="left",
+      yanchor="bottom",
+      x=0.031,
+      y=0.012,
+      buttons=[dict(
+              label=" 🌗 ",
+              method="relayout",
+              args=[{"template":pio.templates['plotly_white']}, 
+                    {"updatemenus[3].buttons[0].label":" 🌗 ",
+                    "updatemenus[3].bordercolor":"green"}],
+              args2=[{"template":pio.templates['plotly_dark']}, 
+                     {"updatemenus[3].buttons[0].label":" 🌗 ",
+                      "updatemenus[3].bordercolor":"gray"}])],
+      font=dict(color="black",size=10),
+      bordercolor="gray",
+      borderwidth=1
+    ),
+    
+    updatemenus+=dict(
+        type="buttons",
+        showactive=False,
+        buttons=[dict(
+            args=[{
+                'scene.camera.center': {'x': 0, 'y': 0, 'z': 0},
+                'scene.camera.eye': {'x': 1.5, 'y': 1.5, 'z': 1.5},
+                'scene.camera.up': {'x': 0, 'y': 0, 'z': 1}
+            }],
+            label="🔲",
+            method='relayout'
+        )],
+        direction="down",
+        x=0.003,
+        y=0.012,
+        xanchor="left",
+        yanchor="bottom",
+        # pad={"r": 10, "t": 10},
+        # font=dict(size=12, color="white"),
+        bordercolor="gray",
+        borderwidth=1
+    ),
+    
+    # Configure layout
+    fig.update_layout(
+        scene=dict(aspectmode='data',
+                  xaxis=dict(visible=False),
+                  yaxis=dict(visible=False),
+                  zaxis=dict(visible=False)),
+        template="plotly_white",
+        updatemenus=updatemenus,
+        hovermode="closest"
+        # title=intensity_columns[-1]  # Initial title matches first intensity column
+    )
+    
+    bdf_name=os.path.basename(bdf_file)
+    """
+    ['---BDF', 'Statistics---', 'SOL', 'None', 'bdf.nodes:', '14582', 'GRID', ':', '14582', 
+     'bdf.elements:', '17256', 'CBAR', ':', '2272', 'CQUAD4', ':', '14980', 'CTRIA3', ':', '4', 
+     'bdf.rigid_elements:', '56', 'RBE3', ':', '56', 'bdf.properties:', '1524', 'PBARL', ':', '740', 'PSHELL', ':', '784']
+    """
+    
+    ll=bdf_model.get_bdf_stats().split()
+    no_nodes=ll[ll.index('bdf.nodes:')+1]
+    no_elements=ll[ll.index('bdf.elements:')+1]
+    no_properties=ll[ll.index('bdf.properties:')+1]
+    try:
+        title=f"<b>{bdf_name}</b><br>Nodes: {no_nodes}<br>Elements: {no_elements}<br>Properties: {no_properties}<br>Default mass: {mass_default:0.2f} kg<br>Optimized mass: {mass_optimized:0.2f} kg"
+    except:
+        title=f"<b>{bdf_name}</b><br>Nodes: {no_nodes}<br>Elements: {no_elements}<br>Properties: {no_properties}<br>Default mass: {mass_default}<br>Optimized mass: {mass_optimized}"
+        
+    
+    fig.update_layout(margin=dict(r=0,l=0,t=0,b=0),
+                      title_text=title,title_x=0.003,title_y=0.98)
+    
+    #--------ANNOTATIONS----------
+
+    # fig.update_layout(annotations=[dict(x=1.02, xanchor="right", yanchor="middle", textangle=-90, xref="paper", yref="paper", 
+    #                                         text="Temperature (Celsius)", showarrow=False,align="right", font=dict(size=14))])
+        
+    # Save result
+    os.chdir(os.path.dirname(excel_file))
+    
+    try:
+        fig.write_html("TTB_summary_plot.html",config={"displayModeBar":False})
+        return 0
+    except Exception as e:
+        print(f"ERROR S-Plot: {e}")
+        return 1
