@@ -1,0 +1,1096 @@
+import os, platform, psutil, getpass
+import subprocess
+import time
+import numpy as np
+import pandas as pd
+import xlwings as xw
+import plotly.graph_objects as go
+import plotly.io as pio
+from pyNastran.bdf.bdf import read_bdf
+from pyNastran.bdf.mesh_utils import free_edges
+import re
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def my_read_bdf(path):
+    try:
+        try: bdf=read_bdf(path,punch=True,xref=True)
+        except: bdf=read_bdf(path,punch=True,xref=False)
+    except:
+        try: bdf=read_bdf(path,punch=False,xref=True)
+        except: bdf=read_bdf(path,punch=False,xref=False)
+    return bdf
+
+
+def plot_free_edges(bdf):
+    """Plot lines connecting free edges in the mesh."""
+    free_nodes = free_edges.non_paired_edges(bdf)
+    x, y, z = [], [], []
+    
+    for node_pair in free_nodes:
+        for nid in node_pair:
+            node_coords = bdf.nodes[nid].xyz
+            x.append(node_coords[0])
+            y.append(node_coords[1])
+            z.append(node_coords[2])
+        # Add None to create breaks between line segments
+        x.append(None)
+        y.append(None)
+        z.append(None)
+    
+    return go.Scatter3d(
+        x=x, y=y, z=z, 
+        mode='lines', 
+        line=dict(color='rgba(50, 50, 50, 1)', width=8),
+        showlegend=False, 
+        hoverinfo="none",
+        name="free_edges",
+        opacity=1
+    )
+
+
+def project_onto(v, target):
+    """
+    this is for CBAR offsets,
+    v: offset vector wa,wb
+    target: normal vector of cbar
+    """
+    axis=np.array(target)
+    v=np.array(v)
+    axis_norm_sq=np.dot(axis,target)
+    return np.dot(v,axis)/axis_norm_sq*target
+    
+
+def offset_cbar_elements(bdf,element,offset_distance):
+    original_bars, left_offset_bars, right_offset_bars= [],[],[]
+    n1,n2=element.nodes
+    p1=np.array(bdf.nodes[n1].get_position())
+    p2=np.array(bdf.nodes[n2].get_position())
+    
+    bar_vector=p2-p1
+    bar_length=np.linalg.norm(bar_vector)
+    bar_unit=bar_vector/bar_length
+    
+    
+    if element.g0 is not None:
+        g0_coord=np.array(bdf.nodes[element.g0].get_position())
+        v_temp=g0_coord-p1
+    else:
+        v_temp=np.array(element.x)
+    
+    if element.wa is not None:
+        wa,wb = element.wa, element.wb
+    else:
+        wa,wb=np.array([0,0,0]),np.array([0,0,0])
+        
+    #make sure v_temp is not parallel to bar_unit
+    if np.isclose(np.abs(np.dot(v_temp/np.linalg.norm(v_temp),bar_unit)),1.0):
+        if not np.isclose(np.abs(bar_unit[0]),1.0):
+            v_temp=np.array([1,0,0])
+        else:
+            v_temp=np.array([0,1,0])
+    
+    y_axis = np.cross(bar_unit,v_temp)
+    y_axis = y_axis / np.linalg.norm(y_axis)
+    
+    z_axis = np.cross(bar_unit,y_axis)
+    z_axis = z_axis / np.linalg.norm(z_axis)
+    
+    y_axis=z_axis
+    wa=project_onto(wa,y_axis)
+    wb=project_onto(wa,y_axis)
+    
+    left_p1=p1+y_axis*offset_distance + wa
+    left_p2=p2+y_axis*offset_distance + wb
+    
+    right_p1=p1-y_axis*offset_distance + wa
+    right_p2=p2-y_axis*offset_distance + wb
+    
+    original_bars.append((p1,p2))
+    left_offset_bars.append((left_p1,left_p2))
+    right_offset_bars.append((right_p1,right_p2))
+    
+    return original_bars, left_offset_bars, right_offset_bars
+
+
+# =============================================================================
+# FASTENER PLOT    
+# =============================================================================
+
+def plot_fastener_points(bdf,fastener_df):
+    # Create dictionaries to store data by diameter
+    diameter_data = {}
+    
+    # Track unique fastener types
+    fastener_types_set = set()
+    elements=fastener_df["Element ID (PBARL)"].to_list()
+    
+    for elid in elements:
+        pid=bdf.elements[elid].pid
+        if bdf.elements[elid].type == "CBAR":
+            # Get fastener info
+            fastener_info = fastener_df[fastener_df["Element ID (PBARL)"] == elid]
+            fastener_type = fastener_info["Pin"].values[0]
+            diameter = float(fastener_info["Diameter"].values[0])
+            
+            # Track fastener type
+            fastener_types_set.add(fastener_type)
+            
+            # Initialize data structure for this diameter if needed
+            if diameter not in diameter_data:
+                diameter_data[diameter] = {}
+            
+            # Initialize data structure for this fastener type if needed
+            if fastener_type not in diameter_data[diameter]:
+                diameter_data[diameter][fastener_type] = {
+                    "x": [], "y": [], "z": [], "pids": [], "elids":[]
+                }
+            
+            # Calculate centroid for element
+            valid_nodes=bdf.elements[elid].nodes
+            if valid_nodes:
+                x = sum(bdf.nodes[nid].xyz[0] for nid in valid_nodes) / len(valid_nodes)
+                y = sum(bdf.nodes[nid].xyz[1] for nid in valid_nodes) / len(valid_nodes)
+                z = sum(bdf.nodes[nid].xyz[2] for nid in valid_nodes) / len(valid_nodes)
+                
+                diameter_data[diameter][fastener_type]["x"].append(x)
+                diameter_data[diameter][fastener_type]["y"].append(y)
+                diameter_data[diameter][fastener_type]["z"].append(z)
+                diameter_data[diameter][fastener_type]["pids"].append(pid)
+                diameter_data[diameter][fastener_type]["elids"].append(elid)
+    
+    traces = []
+    
+    # Color map for different diameters
+    colors = {
+        4.17: "blue", 4.78: "cyan", 6.35: "lime", 7.92: "darkgreen",
+        9.53: "yellow", 11.13: "orange", 12.7: "red", 14.3: "magenta",
+    }
+    
+    # Symbol map for different fastener types
+    symbols = ['circle', 'square', 'x', 'diamond',
+    'diamond-open', 'circle-open', 'square-open', 'cross']
+    symbol_map = {}
+    
+    # Assign a different symbol to each fastener type
+    for i, fastener_type in enumerate(sorted(fastener_types_set)):
+        symbol_map[fastener_type] = symbols[i % len(symbols)]
+    
+    for diameter, type_data in diameter_data.items():
+        for fastener_type, data in type_data.items():
+            if not data["x"]:  # Skip if no points
+                continue
+                
+            trace = go.Scatter3d(
+                x=data["x"], y=data["y"], z=data["z"],
+                mode='markers',
+                marker=dict(
+                    size=diameter,
+                    color=colors.get(diameter, "gray"),
+                    symbol=symbol_map[fastener_type],
+                    opacity=1,
+                    line=dict(width=1, color='rgba(0, 0, 0, 0.5)')
+                ),
+                name=f'Ø{diameter}mm ({fastener_type})',
+                hovertemplate='<i>PBARL %{text}</i><br>Type: ' + fastener_type + '<br>Diameter: ' + str(diameter) + ' mm<extra></extra>',
+                text=data["pids"],
+                hoverinfo='none'
+            )
+            traces.append(trace)
+    
+    return traces
+
+
+def fplot(bdf_file,excel_file):
+    print("\nPLOTTING the TTB_fastener...\n")
+    bdf=my_read_bdf(bdf_file)
+    bdf_name=os.path.basename(bdf_file)
+    pid2eid=bdf.get_property_id_to_element_ids_map()
+    fastener_df=pd.read_excel(excel_file,sheet_name="JOINT")
+    
+    # Generate edge trace
+    edge_trace = plot_free_edges(bdf)
+
+    # Generate fastener traces
+    fastener_traces = plot_fastener_points(bdf,fastener_df)
+
+    # Combine all traces
+    all_traces = [edge_trace] + fastener_traces
+
+    # Create figure with all traces
+    fig = go.Figure(data=all_traces)
+
+    # Update layout with bigger legend and title
+    fig.update_layout(
+        scene=dict(
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
+        ),
+        template="plotly_white",
+        legend=dict(font=dict(size=16), x=0.99, y=1.0)
+    )
+    
+    fig.update_layout(updatemenus=[dict(
+      type="buttons", direction="right", active=0, showactive=True,
+      x=0.5, y=0.0, xanchor="center", yanchor="bottom",
+      buttons=list([
+        dict(args=['template', pio.templates['plotly_white']], label="White Theme", method="relayout"),   
+        dict(args=['template', pio.templates['plotly_dark']], label="Black Theme", method="relayout")
+      ]), 
+      font=dict(color="black")
+    )])
+    
+    title=f"<b>{bdf_name}</b><br>Fastener representation"
+        
+    fig.update_layout(margin=dict(r=0,l=0,t=0,b=0),
+                      title_text=title,title_x=0.003,title_y=0.98)
+    
+    os.chdir(os.path.dirname(excel_file))
+    
+    try:
+        fig.write_html("TTB_fastener_plot.html",config={"displayModeBar":False})
+        return 0
+    except Exception as e:
+        print(f"ERROR F-Plot: {e}")
+        return 1
+
+
+# =============================================================================
+# SUMMARY PLOT - ELEMENT-BASED COLORING (NO VERTEX INTERPOLATION)
+# =============================================================================
+
+def extract_mesh_data(df, bdf):
+    """Extract mesh data - ELEMENT-BASED (each element gets one value)"""
+    
+    df.rename(columns={"Min RF":"RF (min)", "RF min":"RF (min)", "RF min sized":"RF (min) sized"},inplace=True)
+    excluded_columns = ['Property ID']
+    
+    # Get all columns except excluded ones
+    intensity_columns = [col for col in df.columns if col not in excluded_columns]
+    
+    # Store per-element data
+    element_data = []  # List of dicts: {pid, elid, coords, hover_text, intensity_values}
+    
+    global pid_centroids
+    pid_centroids = {}
+    
+    for elid, element in bdf.elements.items():
+        pid = element.pid
+        row = df[df['Property ID'] == pid]
+        if row.empty:
+            continue
+        
+        rf_data = row.iloc[0]
+        
+        # Build hover info
+        hover_info = []
+        for col in df.columns:
+            if col in row.columns and col not in ['Property ID', 'LCID', 'Default Failur(E)', 'Optimized Failur(E)']:
+                if col in ["RF (min)", "RF min"]:
+                    try: hover_info.append(f"<b>⚫</b><br>{col}: {rf_data[col]:0.2f}")
+                    except: hover_info.append(f"<b>⚫</b><br>{col}: {rf_data[col]}")
+                else:
+                    try: hover_info.append(f"{col}: {rf_data[col]:0.2f}")
+                    except: hover_info.append(f"{col}: {rf_data[col]}")
+            elif col=="Property ID":
+                hover_info.append(f"PID: {rf_data[col]:0.0f}")
+            elif col=="LCID":
+                try: hover_info.append(f"{col}: {rf_data[col]:0.0f}<br><b>⚫</b>")
+                except: hover_info.append(f"{col}: {rf_data[col]}<br><b>⚫</b>")
+                
+        hover_text = "<br>".join(hover_info)
+        
+        # Get element coordinates
+        elem_coords = []
+        if element.type == 'CQUAD4':
+            for nid in element.nodes:
+                node_xyz = bdf.nodes[nid].xyz
+                elem_coords.append(node_xyz)
+                pid_centroids.setdefault(pid, []).append(node_xyz)
+                
+        elif element.type == 'CTRIA3':
+            for nid in element.nodes:
+                node_xyz = bdf.nodes[nid].xyz
+                elem_coords.append(node_xyz)
+                pid_centroids.setdefault(pid, []).append(node_xyz)
+                
+        elif element.type == "CBAR":
+            try:
+                prop=bdf.properties[pid]
+                width=max(prop.dim)
+            except:
+                n1,n2=element.nodes
+                p1=np.array(bdf.nodes[n1].get_position())
+                p2=np.array(bdf.nodes[n2].get_position())
+                bar_length=np.linalg.norm(p2-p1)
+                width=bar_length*0.05
+            
+            original_bars,left_offset_bars,right_offset_bars = offset_cbar_elements(bdf,element,width/2)
+            
+            left_p1,left_p2=left_offset_bars[0]
+            right_p1,right_p2=right_offset_bars[0]
+            
+            all_points=[left_p1, right_p1, right_p2, left_p2]  # Form quad
+            for point in all_points:
+                elem_coords.append(point)
+                pid_centroids.setdefault(pid, []).append(point)
+        
+        # Store element data
+        if elem_coords:
+            intensity_vals = {col: rf_data[col] for col in intensity_columns}
+            element_data.append({
+                'pid': pid,
+                'elid': elid,
+                'coords': elem_coords,
+                'hover_text': hover_text,
+                'intensities': intensity_vals,
+                'elem_type': element.type
+            })
+    
+    return element_data, intensity_columns
+
+
+def plot_coordinate_system(bdf, element_data):
+    """Plot X-Y-Z coordinate system axes at the model origin or offset location."""
+    
+    # Find the minimum coordinates from element data
+    all_x, all_y, all_z = [], [], []
+    for elem in element_data:
+        for coord in elem['coords']:
+            all_x.append(coord[0])
+            all_y.append(coord[1])
+            all_z.append(coord[2])
+    
+    x_min = np.min(all_x) - np.std(all_x)
+    y_min = np.min(all_y) - np.std(all_y)
+    z_min = np.min(all_z) - np.std(all_z)
+    
+    # Calculate axis length (5% of model size)
+    x_range = np.max(all_x) - np.min(all_x)
+    y_range = np.max(all_y) - np.min(all_y)
+    z_range = np.max(all_z) - np.min(all_z)
+    axis_length = max(x_range, y_range, z_range) * 0.05
+    
+    axes = []
+    for axis_name, delta in [('X', [axis_length, 0, 0]), 
+                              ('Y', [0, axis_length, 0]), 
+                              ('Z', [0, 0, axis_length])]:
+        axes.append(go.Scatter3d(
+            x=[x_min, x_min + delta[0]],
+            y=[y_min, y_min + delta[1]],
+            z=[z_min, z_min + delta[2]],
+            mode='lines+text',
+            line=dict(color='black', width=4),
+            text=['', axis_name],
+            textposition='top center',
+            textfont=dict(size=12, color='black', family='Arial Black'),
+            showlegend=False,
+            hoverinfo='skip',
+            name=f'{axis_name}_axis'
+        ))
+    
+    return axes
+
+
+def create_mesh_visualization(df, element_data, intensity_columns):
+    """Create mesh visualization with ELEMENT-BASED coloring - SINGLE MESH with duplicated vertices.
+    
+    PERFORMANCE OPTIMIZATIONS:
+    - Pre-allocated lists instead of append() to avoid dynamic resizing
+    - Vectorized color computation using numpy for continuous columns
+    - Single-pass element iteration where possible
+    - Efficient index-based list assignment
+    """
+    
+    removed_ones = ["SubcaseID", "Subcase ID"]
+    for col in removed_ones: 
+        try: intensity_columns.remove(col)
+        except: pass
+    
+    # ===== AUTOMATIC DISCRETE COLUMN DETECTION =====
+    def is_discrete_column(col, df):
+        """Automatically determine if column should be discrete."""
+        col_data = df[col]
+        numeric_data = pd.to_numeric(col_data, errors='coerce')
+        numeric_count = numeric_data.notna().sum()
+        total_count = len(col_data)
+        
+        # If less than 80% are numeric, treat as discrete (has strings)
+        if numeric_count / total_count < 0.8:
+            return True
+        
+        # If mostly numeric, check if values are >= 1000
+        if numeric_count > 0:
+            valid_numbers = numeric_data.dropna()
+            if len(valid_numbers) > 0:
+                # If ANY value is >= 1000, treat as discrete
+                if valid_numbers.max() >= 1000:
+                    return True
+        
+        return False
+    
+    # Determine which columns are discrete
+    discrete_columns = [col for col in intensity_columns if is_discrete_column(col, df)]
+    
+    print(f"\n📊 Column Classification:")
+    print(f"   Discrete: {discrete_columns}")
+    print(f"   Continuous: {[col for col in intensity_columns if col not in discrete_columns]}\n")
+    
+    all_traces = []
+    centroids = {}
+    
+    # Create traces for each column
+    for col_idx, col in enumerate(intensity_columns):
+        is_discrete = col in discrete_columns
+        
+        # Build centroids for ALL columns (for LABELS ON/OFF)
+        if col not in centroids:
+            centroids[col] = {"cx": [], "cy": [], "cz": [], "t": [], "colors": [], "sizes": []}
+            
+            # Find max and min value PIDs (only for continuous - for coloring labels)
+            if not is_discrete:
+                try:
+                    numeric_col = df[col].astype(float)
+                    max_idx = numeric_col.idxmax()
+                    min_idx = numeric_col.idxmin()
+                    max_pid = df.loc[max_idx, 'Property ID']
+                    min_pid = df.loc[min_idx, 'Property ID']
+                except:
+                    max_pid = None
+                    min_pid = None
+            else:
+                max_pid = None
+                min_pid = None
+            
+            for pid, coords_list in pid_centroids.items():
+                row = df[df["Property ID"] == pid]
+                if row.empty:
+                    continue
+                intensity_row = row.iloc[0]
+                
+                coords_arr = np.array(coords_list)
+                centroids[col]["cx"].append(coords_arr[:, 0].mean())
+                centroids[col]["cy"].append(coords_arr[:, 1].mean())
+                centroids[col]["cz"].append(coords_arr[:, 2].mean())
+                
+                # Check if this is the max or min value element (ONLY for continuous)
+                is_max = (pid == max_pid) if not is_discrete else False
+                is_min = (pid == min_pid) if not is_discrete else False
+                
+                # Format text
+                try: 
+                    text_val =f"<b>{intensity_row[col]:0.2f}</b>" 
+                except: 
+                    text_val =f"<b>{intensity_row[col]}</b>" 
+                
+                if is_max:
+                    centroids[col]["t"].append(text_val)
+                    centroids[col]["colors"].append("red")
+                    centroids[col]["sizes"].append(16)
+                elif is_min:
+                    centroids[col]["t"].append(text_val)
+                    centroids[col]["colors"].append("blue")
+                    centroids[col]["sizes"].append(16)
+                else:
+                    centroids[col]["t"].append(text_val)
+                    centroids[col]["colors"].append("black")
+                    centroids[col]["sizes"].append(4)
+        
+        # ===== SINGLE MESH WITH DUPLICATED VERTICES (NO SHARING) =====
+        if is_discrete:
+            # Process values to get categories
+            raw_values = [elem['intensities'][col] for elem in element_data]
+            
+            processed_values = []
+            for v in raw_values:
+                if pd.isna(v) or str(v).strip().lower() in ['nan', 'n/a', '', 'none', 'null']:
+                    processed_values.append("N/A")
+                else:
+                    processed_values.append(str(v))
+            
+            # Get unique categories
+            unique_cats_set = set(processed_values)
+            if "N/A" in unique_cats_set:
+                unique_cats = ["N/A"]
+                unique_cats.extend([cat for cat in dict.fromkeys(processed_values) if cat != "N/A"])
+            else:
+                unique_cats = list(dict.fromkeys(processed_values))
+            
+            # Get top 8 most frequent
+            from collections import Counter
+            value_counts = Counter(processed_values)
+            na_count = None
+            if "N/A" in value_counts:
+                na_count = value_counts.pop("N/A")
+            
+            top_8 = [cat for cat, count in value_counts.most_common(8)]
+            if na_count is not None:
+                top_8 = ["N/A"] + top_8
+            
+            # Category to integer mapping
+            cat_to_int = {cat: idx for idx, cat in enumerate(unique_cats)}
+            
+            # Category to color mapping
+            n_cats = len(unique_cats)
+            base_palette = [
+                '#FF0000', '#0000FF', '#00FF00', '#FFA500', '#FF00FF', '#00FFFF',
+                '#FFFF00', '#800080', '#FFC0CB', '#A52A2A', '#000080',
+                '#8B4513', '#2F4F4F', '#FF1493', '#00CED1', '#FF4500', '#DA70D6',
+                '#32CD32', '#FFD700', '#4169E1', '#FF6347', '#40E0D0', '#EE82EE',
+                '#F0E68C', '#90EE90', '#ADD8E6', '#F08080', '#E0FFFF', '#FAFAD2'
+            ]
+            
+            distinct_colors = []
+            for idx, cat in enumerate(unique_cats):
+                if cat == "N/A":
+                    distinct_colors.append('#808080')
+                else:
+                    color_idx = idx - 1 if "N/A" in unique_cats else idx
+                    distinct_colors.append(base_palette[color_idx % len(base_palette)])
+            
+            # Build colorscale with sharp boundaries
+            colorscale = []
+            for idx in range(n_cats):
+                color = distinct_colors[idx]
+                lower = idx / n_cats
+                upper = (idx + 1) / n_cats
+                colorscale.append([lower, color])
+                colorscale.append([upper, color])
+            
+            # Create SINGLE mesh with duplicated vertices and FACECOLOR
+            # Pre-calculate sizes for efficiency
+            total_verts = sum(len(elem['coords']) for elem in element_data)
+            total_faces = sum(2 if len(elem['coords']) == 4 else 1 for elem in element_data)
+            
+            x_coords = [None] * total_verts
+            y_coords = [None] * total_verts
+            z_coords = [None] * total_verts
+            i_faces = [None] * total_faces
+            j_faces = [None] * total_faces
+            k_faces = [None] * total_faces
+            facecolors = [None] * total_faces
+            hover_texts = [None] * total_verts
+            
+            vert_idx = 0
+            face_idx = 0
+            
+            for elem_idx, elem in enumerate(element_data):
+                coords = elem['coords']
+                n_verts = len(coords)
+                
+                # Get category color
+                cat_value = processed_values[elem_idx]
+                cat_idx = cat_to_int[cat_value]
+                elem_color = distinct_colors[cat_idx]
+                
+                # Add vertices (DUPLICATED - no sharing with other elements)
+                for coord in coords:
+                    x_coords[vert_idx] = coord[0]
+                    y_coords[vert_idx] = coord[1]
+                    z_coords[vert_idx] = coord[2]
+                    hover_texts[vert_idx] = elem['hover_text']
+                    vert_idx += 1
+                
+                # Add faces with facecolor
+                if n_verts == 4:  # Quad - creates 2 triangular faces
+                    offset = vert_idx - 4
+                    i_faces[face_idx] = offset
+                    j_faces[face_idx] = offset + 1
+                    k_faces[face_idx] = offset + 2
+                    facecolors[face_idx] = elem_color
+                    face_idx += 1
+                    
+                    i_faces[face_idx] = offset
+                    j_faces[face_idx] = offset + 2
+                    k_faces[face_idx] = offset + 3
+                    facecolors[face_idx] = elem_color
+                    face_idx += 1
+                    
+                elif n_verts == 3:  # Triangle - creates 1 face
+                    offset = vert_idx - 3
+                    i_faces[face_idx] = offset
+                    j_faces[face_idx] = offset + 1
+                    k_faces[face_idx] = offset + 2
+                    facecolors[face_idx] = elem_color
+                    face_idx += 1
+            
+            # Colorbar config for discrete - use dummy intensity trace
+            tick_vals = [cat_to_int[cat] + 0.5 for cat in top_8 if cat in cat_to_int]
+            tick_text = top_8[:len(tick_vals)]
+            
+            # Main mesh with facecolor (no colorbar)
+            mesh_trace = go.Mesh3d(
+                x=x_coords, y=y_coords, z=z_coords,
+                i=i_faces, j=j_faces, k=k_faces,
+                facecolor=facecolors,  # Direct face coloring - NO INTERPOLATION
+                hoverlabel=dict(
+                    bgcolor="rgba(20, 20, 40, 0.95)",
+                    bordercolor="rgba(100, 150, 255, 0.6)",
+                    font=dict(color="#E0E7FF", size=13, family="'Segoe UI', Roboto, sans-serif")
+                ),
+                opacity=1,
+                lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0, roughness=1.0, fresnel=0.0),
+                flatshading=True,
+                hovertemplate='%{text}<extra></extra>',
+                text=hover_texts,
+                visible=(col_idx == 0),
+                showlegend=False,
+                name=col,
+                hoverinfo='text'
+            )
+            all_traces.append(mesh_trace)
+            
+            # Dummy trace for colorbar
+            colorbar_trace = go.Scatter3d(
+                x=[None], y=[None], z=[None],
+                mode='markers',
+                marker=dict(
+                    size=0.001,
+                    color=[i for i in range(n_cats)],
+                    colorscale=colorscale,
+                    cmin=0,
+                    cmax=n_cats,
+                    colorbar=dict(
+                        title=dict(text=col, side='top'),
+                        tickmode='array',
+                        tickvals=tick_vals,
+                        ticktext=tick_text,
+                        len=0.82,
+                        thickness=15,
+                        x=1.02
+                    )
+                ),
+                visible=(col_idx == 0),
+                showlegend=False,
+                hoverinfo='skip',
+                name=f"{col}_colorbar"
+            )
+            all_traces.append(colorbar_trace)
+            
+        else:
+            # CONTINUOUS - single mesh with facecolor for element-based rendering
+            # Pre-calculate sizes
+            total_verts = sum(len(elem['coords']) for elem in element_data)
+            total_faces = sum(2 if len(elem['coords']) == 4 else 1 for elem in element_data)
+            
+            x_coords = [None] * total_verts
+            y_coords = [None] * total_verts
+            z_coords = [None] * total_verts
+            i_faces = [None] * total_faces
+            j_faces = [None] * total_faces
+            k_faces = [None] * total_faces
+            facecolors = [None] * total_faces
+            hover_texts = [None] * total_verts
+            
+            # Get min/max for colorscale
+            all_intensities = []
+            for elem in element_data:
+                try:
+                    intensity = float(elem['intensities'][col])
+                    all_intensities.append(intensity)
+                except:
+                    all_intensities.append(0.0)
+            
+            color_min = min(all_intensities)
+            color_max = max(all_intensities)
+            
+            # Create Jet colorscale function (import at top of function for efficiency)
+            try:
+                import matplotlib.cm as cm
+                import matplotlib.colors as mcolors
+                norm = mcolors.Normalize(vmin=color_min, vmax=color_max)
+                # Use modern matplotlib API (3.7+)
+                try:
+                    jet = cm.colormaps.get_cmap('jet')
+                except AttributeError:
+                    # Fallback for older matplotlib versions
+                    jet = cm.get_cmap('jet')
+                
+                # Pre-compute all colors at once (vectorized)
+                intensities_array = np.array(all_intensities)
+                rgba_array = jet(norm(intensities_array))
+                
+                vert_idx = 0
+                face_idx = 0
+                
+                for elem_idx, elem in enumerate(element_data):
+                    coords = elem['coords']
+                    n_verts = len(coords)
+                    
+                    # Get pre-computed color
+                    rgba = rgba_array[elem_idx]
+                    elem_color = f'rgb({int(rgba[0]*255)},{int(rgba[1]*255)},{int(rgba[2]*255)})'
+                    
+                    # Add vertices (DUPLICATED - no sharing)
+                    for coord in coords:
+                        x_coords[vert_idx] = coord[0]
+                        y_coords[vert_idx] = coord[1]
+                        z_coords[vert_idx] = coord[2]
+                        hover_texts[vert_idx] = elem['hover_text']
+                        vert_idx += 1
+                    
+                    # Add faces with facecolor
+                    if n_verts == 4:  # Quad - creates 2 triangular faces
+                        offset = vert_idx - 4
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 1
+                        k_faces[face_idx] = offset + 2
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+                        
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 2
+                        k_faces[face_idx] = offset + 3
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+                        
+                    elif n_verts == 3:  # Triangle
+                        offset = vert_idx - 3
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 1
+                        k_faces[face_idx] = offset + 2
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+                        
+            except ImportError:
+                print("Warning: matplotlib not available, using simplified color mapping")
+                # Fallback without matplotlib
+                vert_idx = 0
+                face_idx = 0
+                
+                for elem_idx, elem in enumerate(element_data):
+                    coords = elem['coords']
+                    n_verts = len(coords)
+                    intensity = all_intensities[elem_idx]
+                    
+                    # Simple color mapping without matplotlib
+                    normalized = (intensity - color_min) / (color_max - color_min) if color_max > color_min else 0.5
+                    elem_color = f'rgb({int(normalized*255)},0,{int((1-normalized)*255)})'
+                    
+                    for coord in coords:
+                        x_coords[vert_idx] = coord[0]
+                        y_coords[vert_idx] = coord[1]
+                        z_coords[vert_idx] = coord[2]
+                        hover_texts[vert_idx] = elem['hover_text']
+                        vert_idx += 1
+                    
+                    if n_verts == 4:
+                        offset = vert_idx - 4
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 1
+                        k_faces[face_idx] = offset + 2
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 2
+                        k_faces[face_idx] = offset + 3
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+                    elif n_verts == 3:
+                        offset = vert_idx - 3
+                        i_faces[face_idx] = offset
+                        j_faces[face_idx] = offset + 1
+                        k_faces[face_idx] = offset + 2
+                        facecolors[face_idx] = elem_color
+                        face_idx += 1
+            
+            # Main mesh with facecolor
+            mesh_trace = go.Mesh3d(
+                x=x_coords, y=y_coords, z=z_coords,
+                i=i_faces, j=j_faces, k=k_faces,
+                facecolor=facecolors,  # Direct face coloring - NO INTERPOLATION
+                hoverlabel=dict(
+                    bgcolor="rgba(0, 0, 55, 0.9)",
+                    bordercolor="rgba(255, 255, 255, 0.8)",
+                    font=dict(color="white", size=14)
+                ),
+                opacity=1,
+                lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0, roughness=1.0, fresnel=0.0),
+                flatshading=True,
+                hovertemplate='%{text}<extra></extra>',
+                text=hover_texts,
+                visible=(col_idx == 0),
+                showlegend=False,
+                name=col,
+                hoverinfo='text'
+            )
+            all_traces.append(mesh_trace)
+            
+            # Dummy trace for colorbar
+            colorbar_trace = go.Scatter3d(
+                x=[None], y=[None], z=[None],
+                mode='markers',
+                marker=dict(
+                    size=0.001,
+                    color=[color_min, color_max],
+                    colorscale="Jet",
+                    cmin=color_min,
+                    cmax=color_max,
+                    colorbar=dict(
+                        title=dict(text=col, side='top'),
+                        len=0.82,
+                        thickness=15,
+                        x=1.02
+                    )
+                ),
+                visible=(col_idx == 0),
+                showlegend=False,
+                hoverinfo='skip',
+                name=f"{col}_colorbar"
+            )
+            all_traces.append(colorbar_trace)
+        
+        # Add label trace for ALL columns (both discrete and continuous)
+        label_trace = go.Scatter3d(
+            x=centroids[col]["cx"], 
+            y=centroids[col]["cy"], 
+            z=centroids[col]["cz"],
+            mode="text+markers",
+            text=centroids[col]["t"],
+            textfont=dict(size=11, color=centroids[col]["colors"]),
+            marker=dict(
+                color=centroids[col]["colors"],
+                symbol="diamond",
+                size=centroids[col]["sizes"]
+            ),
+            name="Labels ON/OFF",
+            showlegend=True,
+            hoverinfo="skip",
+            visible=(col_idx == 0),
+            textposition="top center"
+        )
+        all_traces.append(label_trace)
+    
+    # Create buttons - each column now has 3 traces (mesh + colorbar + labels)
+    buttons = []
+    for col_idx, col in enumerate(intensity_columns):
+        visible = [False] * len(all_traces)
+        
+        # Each column has exactly 3 traces: mesh (3*col_idx), colorbar (3*col_idx+1), labels (3*col_idx+2)
+        visible[3*col_idx] = True      # Mesh trace
+        visible[3*col_idx + 1] = True  # Colorbar trace
+        visible[3*col_idx + 2] = True  # Label trace
+        
+        # Always show edges + axes (last 5 traces)
+        visible.extend([True, True, True, True, True])
+        
+        label = col if len(col) <= 25 else col[:22] + "..."
+        buttons.append({
+            'label': f'📊 {label}',
+            'method': "update",
+            'args': [{"visible": visible}]
+        })
+    
+    updatemenus = [{
+        'buttons': buttons,
+        'direction': 'down',
+        'showactive': True,
+        'x': 1.01,
+        'xanchor': "right",
+        'y': 0.989,
+        'yanchor': "top",
+        'font': {'color': 'black', 'size': 11}
+    }]
+    
+    # Create edges trace - optimized with pre-allocation
+    # Calculate total edge segments needed
+    total_edge_segments = sum(
+        (4 if len(elem['coords']) == 4 else 3) for elem in element_data
+    )
+    # Each edge needs 2 points + 1 None separator = 3 items per edge
+    edge_size = total_edge_segments * 3
+    
+    edges_x = [None] * edge_size
+    edges_y = [None] * edge_size
+    edges_z = [None] * edge_size
+    
+    idx = 0
+    for elem in element_data:
+        coords = elem['coords']
+        n_verts = len(coords)
+        
+        if n_verts == 4:  # Quad
+            edges = [[0,1], [1,2], [2,3], [3,0]]
+        elif n_verts == 3:  # Triangle
+            edges = [[0,1], [1,2], [2,0]]
+        else:
+            continue
+        
+        for edge in edges:
+            edges_x[idx] = coords[edge[0]][0]
+            edges_y[idx] = coords[edge[0]][1]
+            edges_z[idx] = coords[edge[0]][2]
+            idx += 1
+            
+            edges_x[idx] = coords[edge[1]][0]
+            edges_y[idx] = coords[edge[1]][1]
+            edges_z[idx] = coords[edge[1]][2]
+            idx += 1
+            
+            # None separator
+            idx += 1  # edges_x[idx] is already None from pre-allocation
+    
+    edges_trace = go.Scatter3d(
+        x=edges_x, y=edges_y, z=edges_z,
+        mode='lines',
+        line=dict(color='black', width=1),
+        hoverinfo="none",
+        showlegend=False,
+        name="edge_traces"
+    )
+    
+    return all_traces, edges_trace, updatemenus
+
+
+def splot(bdf_file, excel_file):
+    """read TTB summary excel and plots 3D mesh plot w plotly by also using pynastran"""
+    
+    # Load data
+    print("\nPLOTTING the TTB_summary...\n")
+    df = pd.read_excel(excel_file)
+    bdf_model = my_read_bdf(bdf_file)
+    
+    mass_default, mass_optimized = "n/a", "n/a"
+    if "mass (kg) default" in df.columns:
+        mass_default = df["mass (kg) default"].sum()
+    if "mass (kg) optimized" in df.columns:
+        mass_optimized = df["mass (kg) optimized"].sum()
+    
+    # Extract mesh data
+    element_data, intensity_columns = extract_mesh_data(df, bdf_model)
+    
+    # Create visualization
+    mesh_traces, edges_trace, updatemenus = create_mesh_visualization(df, element_data, intensity_columns)
+    
+    # Add free edges
+    free_edges_trace = plot_free_edges(bdf_model)
+    
+    # Add custom coordinate system
+    coord_system_traces = plot_coordinate_system(bdf_model, element_data)
+    
+    # Create figure with all traces
+    fig = go.Figure(data=mesh_traces + [edges_trace, free_edges_trace] + coord_system_traces)
+    
+    # Calculate opacity lists - each column has 3 traces (mesh + colorbar + labels)
+    n_columns = len(intensity_columns)
+    n_col_traces = n_columns * 3  # Each column: mesh + colorbar + labels
+    
+    # For transparency toggle: make only mesh traces semi-transparent
+    opacity_on = []
+    for i in range(n_col_traces):
+        if i % 3 == 0:  # Mesh traces (indices 0, 3, 6, 9...)
+            opacity_on.append(0.5)
+        else:  # Colorbar and label traces
+            opacity_on.append(1.0)
+    opacity_on.extend([1, 1, 1, 1, 1])  # edges, free_edges, X, Y, Z axes - always opaque
+    
+    opacity_off = [1] * len(fig.data)
+    
+    # Button 1: Theme toggle
+    updatemenus.append(dict(
+        type="buttons", active=0, showactive=True,
+        xanchor="left", yanchor="bottom", x=0.031, y=0.012,
+        buttons=[dict(
+            label=" 🌗 ",
+            method="relayout",
+            args=[{"template": pio.templates['plotly_white']}],
+            args2=[{"template": pio.templates['plotly_dark']}]
+        )],
+        font=dict(color="black", size=10),
+        bordercolor="gray", borderwidth=1
+    ))
+    
+    # Button 2: Reset camera
+    updatemenus.append(dict(
+        type="buttons", showactive=False,
+        buttons=[dict(
+            args=[{
+                'scene.camera.center': {'x': 0, 'y': 0, 'z': 0},
+                'scene.camera.eye': {'x': 1.5, 'y': 1.5, 'z': 1.5},
+                'scene.camera.up': {'x': 0, 'y': 0, 'z': 1}
+            }],
+            label="🔲", method='relayout'
+        )],
+        direction="down", x=0.003, y=0.012,
+        xanchor="left", yanchor="bottom",
+        bordercolor="gray", borderwidth=1
+    ))
+    
+    # Button 3: Edge visibility toggle
+    updatemenus.append(dict(
+        type="buttons", direction="right", active=0, showactive=True,
+        xanchor="left", yanchor="bottom", x=0.059, y=0.012,
+        buttons=[dict(
+            label=" 💠 ",
+            method="restyle",
+            args=[{"mode": ['lines' if trace.name == "edge_traces" else getattr(trace, 'mode', None) for trace in fig.data]}],
+            args2=[{"mode": ['text' if trace.name == "edge_traces" else getattr(trace, 'mode', None) for trace in fig.data]}]
+        )],
+        font=dict(color="black", size=10),
+        bordercolor="gray", borderwidth=1
+    ))
+    
+    # Button 4: Transparency toggle
+    updatemenus.append(dict(
+        type="buttons", showactive=True, active=1,
+        xanchor="left", yanchor="bottom", x=0.087, y=0.012,
+        buttons=[dict(
+            label=" 👁‍🗨 ",
+            method="restyle",
+            args=[{"opacity": opacity_on}],
+            args2=[{"opacity": opacity_off}]
+        )],
+        font=dict(color="black", size=10),
+        bordercolor="gray", borderwidth=1
+    ))
+    
+    bdf_name = os.path.basename(bdf_file)
+    
+    ll = bdf_model.get_bdf_stats().split()
+    no_nodes = ll[ll.index('bdf.nodes:') + 1]
+    no_elements = ll[ll.index('bdf.elements:') + 1]
+    no_properties = ll[ll.index('bdf.properties:') + 1]
+    
+    try:
+        title = f"<b style='color:#1F2937;'>{bdf_name}</b><br><span style='font-size:11px; color:#6B7280;'>Nodes: {no_nodes} | Elements: {no_elements} | Properties: {no_properties}</span><br><span style='font-size:11px; color:#059669;'>Default: {mass_default:0.2f} kg</span> <span style='font-size:11px; color:#DC2626;'>→</span> <span style='font-size:11px; color:#2563EB;'>Optimized: {mass_optimized:0.2f} kg</span>"
+    except:
+        title = f"<b style='color:#1F2937;'>{bdf_name}</b><br><span style='font-size:11px; color:#6B7280;'>Nodes: {no_nodes} | Elements: {no_elements} | Properties: {no_properties}</span><br><span style='font-size:11px; color:#059669;'>Default: {mass_default}</span> <span style='font-size:11px; color:#DC2626;'>→</span> <span style='font-size:11px; color:#2563EB;'>Optimized: {mass_optimized}</span>"
+    
+    fig.update_layout(
+        margin=dict(r=0, l=0, t=0, b=0),
+        title_text=title, title_x=0.003, title_y=0.98,
+        scene=dict(
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
+        ),
+        template="plotly_white",
+        updatemenus=updatemenus,
+        hovermode="closest",
+        legend=dict(x=1.01, y=0.012, xanchor="right", yanchor="bottom", bordercolor="gray", borderwidth=1)
+    )
+    
+    os.chdir(os.path.dirname(excel_file))
+    
+    try:
+        fig.write_html("TTB_summary_plot.html", config={"displayModeBar": False})
+        print(f"✓ HTML saved: {len(fig.data)} traces total (3 per column + 5 fixed)")
+        print(f"✓ Element-based coloring: Using facecolor for TRUE flat colors (no interpolation)")
+        return 0
+    except Exception as e:
+        print(f"ERROR S-Plot: {e}")
+        return 1
+
+
+# Example usage (uncomment to run):
+bdf = r'C:/Users/User/Desktop/VSCODE/95_MISGEN/updated_statics.bdf'
+xls = r'C:/Users/User/Desktop/VSCODE/95_MISGEN/updated_statics_misc.xlsx'
+splot(bdf, xls)
