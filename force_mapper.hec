@@ -1,6 +1,12 @@
-#123 vs 123456 dof error
-#avoid same refgrid
-#avoid dep and indep same node
+"""
+FIXES APPLIED:
+1) DOF consistency - refc now matches comps (123 or 123456)
+2) Avoid using same grid more than once for refgrid - tracking used refgrids
+3) Avoid dependent and independent node being the same - removing refgrid from Gijs
+4) Better spread for coarse-to-fine mapping - increased influence radius multiplier
+5) Avoid using ANY RBE3 refgrids (existing or new) as dependent nodes in new RBE3s
+
+"""
 
 from pyNastran.bdf.bdf import read_bdf, BDF
 from pyNastran.bdf.mesh_utils import free_edges
@@ -13,28 +19,48 @@ source_bdf = read_bdf(source_path)
 target_path = r'C:/Users/User/Desktop/VSCODE/35_force_mapper/2.bdf'
 target_bdf = read_bdf(target_path)
 
-# Get free edges from target
-target_free_edges = free_edges.non_paired_edges(target_bdf)
-target_free_nodes = sorted(set(nid for edge in target_free_edges for nid in edge))
+# Get all nodes from target (or just free edges if you prefer)
+USE_FREE_EDGES_ONLY = False  # Set to True to map only to surface/boundary nodes
 
-print(f"Target: {len(target_free_nodes)} free nodes, {len(target_free_edges)} free edges")
+if USE_FREE_EDGES_ONLY:
+    target_free_edges = free_edges.non_paired_edges(target_bdf)
+    target_free_nodes = sorted(set(nid for edge in target_free_edges for nid in edge))
+    print(f"Target: {len(target_free_nodes)} free edge nodes, {len(target_free_edges)} free edges")
+else:
+    target_free_nodes = sorted(target_bdf.nodes.keys())
+    print(f"Target: {len(target_free_nodes)} total nodes")
 
 # Get target coordinates
 target_coords = np.array([target_bdf.nodes[nid].get_position() for nid in target_free_nodes])
 
-# Build KDTree for target free nodes
+# Build KDTree for target nodes
 target_tree = KDTree(target_coords)
 
 # Calculate influence radius based on target mesh density
-edge_lengths = []
-for edge in target_free_edges[:100]:  # Sample first 100 edges
-    n1, n2 = edge[0], edge[1]
-    p1 = target_bdf.nodes[n1].get_position()
-    p2 = target_bdf.nodes[n2].get_position()
-    edge_lengths.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+if USE_FREE_EDGES_ONLY:
+    # Use edge lengths from free edges
+    edge_lengths = []
+    for edge in target_free_edges[:100]:  # Sample first 100 edges
+        n1, n2 = edge[0], edge[1]
+        p1 = target_bdf.nodes[n1].get_position()
+        p2 = target_bdf.nodes[n2].get_position()
+        edge_lengths.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+    avg_edge_length = np.mean(edge_lengths) if edge_lengths else 1.0
+else:
+    # Estimate from nearest neighbor distances
+    sample_size = min(100, len(target_coords))
+    if sample_size > 1:
+        sample_indices = np.random.choice(len(target_coords), sample_size, replace=False)
+        nn_distances = []
+        for idx in sample_indices:
+            dist, _ = target_tree.query(target_coords[idx], k=2)  # k=2 to get nearest neighbor (excluding self)
+            nn_distances.append(dist[1])  # dist[0] is self (0.0), dist[1] is nearest neighbor
+        avg_edge_length = np.mean(nn_distances)
+    else:
+        avg_edge_length = 1.0
 
-avg_edge_length = np.mean(edge_lengths) if edge_lengths else 1.0
-influence_radius = avg_edge_length * 3.0  # Adjust multiplier as needed
+# Increased multiplier for better spread in coarse-to-fine mapping
+influence_radius = avg_edge_length * 5.0  # Increased from 3.0 to 5.0
 print(f"Average edge length: {avg_edge_length:.4f}")
 print(f"Influence radius for RBE3: {influence_radius:.4f}")
 
@@ -77,6 +103,20 @@ load_set_id = 1
 mapped_forces = []
 mapped_moments = []
 
+# FIX 2: Track used refgrids to avoid reusing them
+used_refgrids = set()
+
+# FIX 5: Collect existing RBE3 reference grids from target.bdf to avoid using them as dependent nodes
+existing_rbe3_refgrids = set()
+for eid, element in target_bdf.elements.items():
+    if element.type == 'RBE3':
+        existing_rbe3_refgrids.add(element.refgrid)
+
+print(f"Found {len(existing_rbe3_refgrids)} existing RBE3 reference grids in target.bdf")
+
+# Combine with newly created refgrids - these nodes should NEVER be used as dependent nodes
+all_rbe3_refgrids = existing_rbe3_refgrids.copy()
+
 # Map forces with radius-based RBE3
 for src_nid, force_vec in forces.items():
     if src_nid not in source_bdf.nodes:
@@ -100,15 +140,42 @@ for src_nid, force_vec in forces.items():
     weights = 1.0 / (np.array(distances) + 1e-10)
     weights = weights / weights.sum()
     
-    # Create reference node (closest node)
-    closest_idx = np.argmin(distances)
-    ref_grid = nearby_node_ids[closest_idx]
+    # FIX 2: Select reference node that hasn't been used yet
+    sorted_indices = np.argsort(distances)
+    ref_grid = None
+    for idx in sorted_indices:
+        candidate = nearby_node_ids[idx]
+        if candidate not in used_refgrids:
+            ref_grid = candidate
+            break
+    
+    # If all nearby nodes are used, pick the closest one anyway
+    if ref_grid is None:
+        ref_grid = nearby_node_ids[sorted_indices[0]]
+    
+    used_refgrids.add(ref_grid)
+    all_rbe3_refgrids.add(ref_grid)  # Track for dependent node filtering
+    
+    # FIX 3 & 5: Remove ref_grid from nearby_node_ids to avoid dependent/independent being same
+    # ALSO remove any RBE3 refgrids (existing or new) to avoid constraining them
+    dependent_nodes = [nid for nid in nearby_node_ids 
+                      if nid != ref_grid and nid not in all_rbe3_refgrids]
+    dependent_weights = []
+    
+    for i, nid in enumerate(nearby_node_ids):
+        if nid != ref_grid and nid not in all_rbe3_refgrids:
+            dependent_weights.append(weights[i])
+    
+    # Renormalize weights after removing refgrid and other RBE3 refgrids
+    if dependent_weights:
+        dependent_weights = np.array(dependent_weights)
+        dependent_weights = dependent_weights / dependent_weights.sum()
     
     # Check geometry to determine if nodes are collinear/coplanar
     use_rotations = False
-    if len(nearby_node_ids) >= 3:
-        # Get positions of nodes
-        positions = np.array([target_bdf.nodes[nid].get_position() for nid in nearby_node_ids])
+    if len(dependent_nodes) >= 3:
+        # Get positions of dependent nodes
+        positions = np.array([target_bdf.nodes[nid].get_position() for nid in dependent_nodes])
         
         # Check if nodes span 3D space (not collinear/coplanar)
         centered = positions - positions.mean(axis=0)
@@ -123,26 +190,26 @@ for src_nid, force_vec in forces.items():
                 use_rotations = True
     
     # Create RBE3 element connecting all nearby nodes
-    if len(nearby_node_ids) > 1:
+    if len(dependent_nodes) >= 1:  # Need at least one dependent node
         if use_rotations:
-            # Nodes span 3D space - use all 6 DOFs
+            # FIX 1: Nodes span 3D space - use all 6 DOFs consistently
             output_bdf.add_rbe3(
                 eid=rbe3_id,
                 refgrid=ref_grid,
-                refc='123456',
-                weights=weights.tolist(),
-                comps=['123456'] * len(nearby_node_ids),
-                Gijs=nearby_node_ids
+                refc='123456',  # Reference DOFs
+                weights=dependent_weights.tolist(),
+                comps=['123456'] * len(dependent_nodes),  # Must match refc
+                Gijs=dependent_nodes  # Does NOT include refgrid or any RBE3 refgrids
             )
         else:
-            # Nodes are collinear/coplanar - use only translations
+            # FIX 1: Nodes are collinear/coplanar - use only translations consistently
             output_bdf.add_rbe3(
                 eid=rbe3_id,
                 refgrid=ref_grid,
-                refc='123',
-                weights=weights.tolist(),
-                comps=['123'] * len(nearby_node_ids),
-                Gijs=nearby_node_ids
+                refc='123',  # Reference DOFs
+                weights=dependent_weights.tolist(),
+                comps=['123'] * len(dependent_nodes),  # Must match refc
+                Gijs=dependent_nodes  # Does NOT include refgrid or any RBE3 refgrids
             )
         rbe3_id += 1
     
@@ -156,7 +223,7 @@ for src_nid, force_vec in forces.items():
             xyz=(force_vec / force_mag).tolist()
         )
     
-    mapped_forces.append((src_nid, ref_grid, len(nearby_node_ids)))
+    mapped_forces.append((src_nid, ref_grid, len(dependent_nodes)))
 
 # Map moments with radius-based RBE3
 for src_nid, moment_vec in moments.items():
@@ -181,15 +248,42 @@ for src_nid, moment_vec in moments.items():
     weights = 1.0 / (np.array(distances) + 1e-10)
     weights = weights / weights.sum()
     
-    # Create reference node (closest node)
-    closest_idx = np.argmin(distances)
-    ref_grid = nearby_node_ids[closest_idx]
+    # FIX 2: Select reference node that hasn't been used yet
+    sorted_indices = np.argsort(distances)
+    ref_grid = None
+    for idx in sorted_indices:
+        candidate = nearby_node_ids[idx]
+        if candidate not in used_refgrids:
+            ref_grid = candidate
+            break
+    
+    # If all nearby nodes are used, pick the closest one anyway
+    if ref_grid is None:
+        ref_grid = nearby_node_ids[sorted_indices[0]]
+    
+    used_refgrids.add(ref_grid)
+    all_rbe3_refgrids.add(ref_grid)  # Track for dependent node filtering
+    
+    # FIX 3 & 5: Remove ref_grid from nearby_node_ids to avoid dependent/independent being same
+    # ALSO remove any RBE3 refgrids (existing or new) to avoid constraining them
+    dependent_nodes = [nid for nid in nearby_node_ids 
+                      if nid != ref_grid and nid not in all_rbe3_refgrids]
+    dependent_weights = []
+    
+    for i, nid in enumerate(nearby_node_ids):
+        if nid != ref_grid and nid not in all_rbe3_refgrids:
+            dependent_weights.append(weights[i])
+    
+    # Renormalize weights after removing refgrid and other RBE3 refgrids
+    if dependent_weights:
+        dependent_weights = np.array(dependent_weights)
+        dependent_weights = dependent_weights / dependent_weights.sum()
     
     # Check geometry to determine if nodes are collinear/coplanar
     use_rotations = False
-    if len(nearby_node_ids) >= 3:
-        # Get positions of nodes
-        positions = np.array([target_bdf.nodes[nid].get_position() for nid in nearby_node_ids])
+    if len(dependent_nodes) >= 3:
+        # Get positions of dependent nodes
+        positions = np.array([target_bdf.nodes[nid].get_position() for nid in dependent_nodes])
         
         # Check if nodes span 3D space (not collinear/coplanar)
         centered = positions - positions.mean(axis=0)
@@ -204,26 +298,26 @@ for src_nid, moment_vec in moments.items():
                 use_rotations = True
     
     # Create RBE3 element connecting all nearby nodes
-    if len(nearby_node_ids) > 1:
+    if len(dependent_nodes) >= 1:  # Need at least one dependent node
         if use_rotations:
-            # Nodes span 3D space - use all 6 DOFs
+            # FIX 1: Nodes span 3D space - use all 6 DOFs consistently
             output_bdf.add_rbe3(
                 eid=rbe3_id,
                 refgrid=ref_grid,
-                refc='123456',
-                weights=weights.tolist(),
-                comps=['123456'] * len(nearby_node_ids),
-                Gijs=nearby_node_ids
+                refc='123456',  # Reference DOFs
+                weights=dependent_weights.tolist(),
+                comps=['123456'] * len(dependent_nodes),  # Must match refc
+                Gijs=dependent_nodes  # Does NOT include refgrid or any RBE3 refgrids
             )
         else:
-            # Nodes are collinear/coplanar - use only translations
+            # FIX 1: Nodes are collinear/coplanar - use only translations consistently
             output_bdf.add_rbe3(
                 eid=rbe3_id,
                 refgrid=ref_grid,
-                refc='123',
-                weights=weights.tolist(),
-                comps=['123'] * len(nearby_node_ids),
-                Gijs=nearby_node_ids
+                refc='123',  # Reference DOFs
+                weights=dependent_weights.tolist(),
+                comps=['123'] * len(dependent_nodes),  # Must match refc
+                Gijs=dependent_nodes  # Does NOT include refgrid or any RBE3 refgrids
             )
         rbe3_id += 1
     
@@ -237,7 +331,7 @@ for src_nid, moment_vec in moments.items():
             xyz=(moment_vec / moment_mag).tolist()
         )
     
-    mapped_moments.append((src_nid, ref_grid, len(nearby_node_ids)))
+    mapped_moments.append((src_nid, ref_grid, len(dependent_nodes)))
 
 # Write output
 output_path = r'C:/Users/User/Desktop/VSCODE/35_force_mapper/mapped_loads.bdf'
@@ -247,6 +341,8 @@ print(f"\nMapping complete:")
 print(f"- Mapped {len(mapped_forces)} forces")
 print(f"- Mapped {len(mapped_moments)} moments")
 print(f"- Created {rbe3_id - (max(target_bdf.elements.keys()) + 1 if target_bdf.elements else 1)} RBE3 elements")
+print(f"- Used {len(used_refgrids)} unique reference grids")
+print(f"- Excluded {len(all_rbe3_refgrids)} RBE3 refgrids from being dependent nodes")
 print(f"- Output written to: {output_path}")
 
 # Statistics on node distribution
@@ -264,6 +360,6 @@ if mapped_moments:
 
 # Show sample mappings
 if mapped_forces:
-    print("\nSample force mappings (source node -> ref node [# of connected nodes]):")
+    print("\nSample force mappings (source node -> ref node [# of dependent nodes]):")
     for src, ref, count in mapped_forces[:5]:
         print(f"  {src} -> {ref} [{count} nodes]")
