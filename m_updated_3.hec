@@ -1,0 +1,1220 @@
+from pyNastran.bdf.bdf import read_bdf
+from pyNastran.bdf.mesh_utils.breakdowns import get_mass_breakdown
+from pyNastran.bdf.mesh_utils.mass_properties import mass_properties
+from pyNastran.bdf.mesh_utils import free_edges
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import math
+import os
+import pyfiglet
+from datetime import datetime
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# CONSTANTS - Centralized configuration
+# =============================================================================
+# Material IDs
+MAT_PH13_8 = 120000
+MAT_2050_T84 = 100000
+MAT_2024_T3_CLAD = 102000
+MAT_TI_6AL_4V = 110000
+MAT_AS4C_M21_A = 132000
+MAT_AS4C_M21_B = 232000
+MAT_AS4C_M21_C = 232003
+MAT_IM7_M91_A = 230003
+MAT_IM7_M91_B = 230004
+MAT_QUARTZ = 240002
+
+# Default values
+DEFAULT_STIFFENER_FLANGE = 40
+DEFAULT_CORE_MAT = "HRH-36-4.0-96 Core"
+DEFAULT_LAYUP = [0.25, 0.25, 0.25, 0.25]
+
+# Property ID digit positions indicate component type
+# Position 2: '1'=upper skin, '2'=lower skin, '3'/'4'=substructure, '0'=other
+PID_UPPER_SKIN = '1'
+PID_LOWER_SKIN = '2'
+PID_SUBSTRU_A = '3'
+PID_SUBSTRU_B = '4'
+PID_OTHER = '0'
+
+# =============================================================================
+# MAIN PROCESSING FUNCTION
+# =============================================================================
+def main():
+    """Main processing function - extracts properties and creates output Excel"""
+    global bdf, file_name, storage
+    
+    result_label.config(text="PROCESSING...", fg='#ffaa00')
+    root.update_idletasks()
+    
+    # Read BDF file
+    path = Path(file_entry.get())
+    bdf = my_read_bdf(path)
+    if bdf is None:
+        result_label.config(text="ERROR !", fg='#ff4444')
+        return 1
+    
+    pid2eid = bdf.get_property_id_to_element_ids_map()
+    
+    # Setup output directory
+    folder = os.path.dirname(path)
+    os.chdir(folder)
+    file_name = os.path.split(path)[-1].replace(".BDF", "").replace(".bdf", "")
+    
+    # Change misc file entry color to gray
+    # file_entry2.config(state=tk.DISABLED, disabledbackground='#333333', disabledforeground='#666666')
+    # root.update_idletasks()
+    
+    
+    # Initialize storage dictionary
+    storage = initialize_storage_dict()
+    
+    # Default boundary conditions
+    ue = "Simply Supported"
+    le = "Simply Supported"
+    
+    PBARL_ll = []
+    PSHELL_ll = []
+
+    # Process all properties
+    for pid in tqdm(bdf.properties):
+        prop_type = bdf.properties[pid].type
+        
+        if prop_type == "PSHELL":
+            process_pshell(pid, PSHELL_ll)
+        elif prop_type == "PCOMP":
+            process_pcomp(pid, PSHELL_ll)
+        elif prop_type == "PBARL":
+            process_pbarl(pid, PBARL_ll, PSHELL_ll)
+    
+    # Create general dataframe
+    try:
+        df_general = pd.DataFrame(storage)
+    except Exception as e:
+        result_label.config(text="ERROR creating dataframe!", fg="Firebrick")
+        print(f"ERROR - {e}")
+        return 1
+    
+    # Process joint data
+    try:
+        df_join = process_joint_data(bdf, PBARL_ll, PSHELL_ll, pid2eid, df_general)
+    except Exception as e:
+        result_label.config(text="ERROR about .bdf file!", fg="Firebrick")
+        print(f"ERROR - {e}")
+        return 1
+    
+    # Update CAI fwidth and boundary conditions
+    df_general = update_boundary_conditions(df_general, df_join)
+    
+    # Create stats dataframe
+    stats = {"BDF STATS": [bdf.get_bdf_stats()[30:]]}
+    df_stats = pd.DataFrame(stats)
+    
+    # Write output
+    write_output_excel(folder, file_name, df_general, df_join, path)
+    
+    result_label.config(text="DONE !", fg=colors['fg_green'],font=('Consolas', 10, 'bold'))
+    root.update_idletasks()
+    
+    out_path = os.path.join(folder, f"{file_name}_misc.xlsx")
+    print(f"\nOutput excel is written here: {out_path}\n")
+    if panel_plot:
+        plot_dir = os.path.join(os.getcwd(), f"{file_name}_PanelPlots")
+        print(f"Plots are saved here: {plot_dir}\n")
+
+
+def initialize_storage_dict():
+    return {
+        "Type": [], "Property ID": [], "MAT ID": [], "MAT": [], "T": [],
+        "Core MAT": [], "Core T": [], "W": [],
+        "n1": [], "n2": [], "n3": [], "n4": [], "aoff (deg)": [],
+        "X-Length (mm)": [], "Y-Length (mm)": [], "Dhole (mm)": [],
+        "... ": [],
+        "Crippling Section": [], "Ftu (A-basis)": [], "Fty (A-basis)": [],
+        "Ftu (B-basis)": [], "Fty (B-basis)": [], "Fdur": [], "Class": [],
+        "CAI fwidth": [], "Unloaded edges": [], "Loaded edges": [],
+        "X Boundary (Ritz)": [], "Y Boundary (Ritz)": [],
+        "Edge restraint (Ritz)": [], "Percent Fixity (Ritz)": [],
+        "...": [],        # <-- dummy separator
+        "Offset": []      # <-- new offset flag
+    }
+
+
+def get_component_class(pid):
+    """Determine component class based on Property ID"""
+    pid_str = str(pid)
+    if len(pid_str) >= 3:
+        return "B" if pid_str[2] in [PID_UPPER_SKIN, PID_LOWER_SKIN] else "A"
+    return "A"
+
+
+def get_core_properties(pid):
+    """Get core material and thickness based on Property ID"""
+    pid_str = str(pid)
+    if len(pid_str) >= 3 and pid_str[2] in [PID_UPPER_SKIN, PID_LOWER_SKIN]:
+        return DEFAULT_CORE_MAT, 0
+    return "n/a", "n/a"
+
+
+def process_pshell(pid, pshell_list):
+    """Process PSHELL property"""
+    lengths = get_panel_dimensions(pid)
+    mid = bdf.properties[pid].mid1
+    mid_name, ftu_a, fty_a, ftu_b, fty_b, fdur, layup, cpt = mat_identify(mid, oh=False)
+    t = bdf.properties[pid].t
+    w = "n/a"
+    ply = round(t / cpt)
+    n1, n2, n3, n4 = get_plies(ply, layup)
+    core_mat, core_t = get_core_properties(pid)
+    klass = get_component_class(pid)
+    
+    append_to_storage(
+        prop_type="PSHELL",
+        pid=pid,
+        mid=mid,
+        mid_name=mid_name,
+        t=t,
+        w=w,
+        n1=n1, n2=n2, n3=n3, n4=n4,
+        lengths=lengths,
+        core_mat=core_mat,
+        core_t=core_t,
+        ftu_a=ftu_a, fty_a=fty_a,
+        ftu_b=ftu_b, fty_b=fty_b,
+        fdur=fdur,
+        klass=klass,
+        crippling_section="n/a"
+    )
+    
+    pshell_list.append(pid)
+
+
+def process_pcomp(pid, pshell_list):
+    """Process PCOMP property"""
+    lengths = get_panel_dimensions(pid)
+    mid = bdf.properties[pid].mids[0]
+    mid_name, ftu_a, fty_a, ftu_b, fty_b, fdur, layup, cpt = mat_identify(mid, oh=False)
+    
+    # Handle composite thickness
+    if len(bdf.properties[pid].thicknesses) > 1:
+        thicknesses = np.array(bdf.properties[pid].thicknesses)
+        core_t = sum(thicknesses[(thicknesses > 0.5)])
+        t = sum(thicknesses[(thicknesses < 0.5)])
+    else:
+        t = sum(bdf.properties[pid].thicknesses)
+    
+    w = "n/a"
+    ply = round(t / cpt)
+    n1, n2, n3, n4 = get_plies(ply, layup)
+    core_mat, core_t = get_core_properties(pid)
+    klass = get_component_class(pid)
+    
+    append_to_storage(
+        prop_type="PCOMP",
+        pid=pid,
+        mid=mid,
+        mid_name=mid_name,
+        t=t,
+        w=w,
+        n1=n1, n2=n2, n3=n3, n4=n4,
+        lengths=lengths,
+        core_mat=core_mat,
+        core_t=core_t,
+        ftu_a=ftu_a, fty_a=fty_a,
+        ftu_b=ftu_b, fty_b=fty_b,
+        fdur=fdur,
+        klass=klass,
+        crippling_section="n/a"
+    )
+    
+    pshell_list.append(pid)
+
+
+def process_pbarl(pid, pbarl_list, pshell_list):
+    """Process PBARL property"""
+    lengths = ["n/a", "n/a"]
+    mid = bdf.properties[pid].mid
+    mid_name, ftu_a, fty_a, ftu_b, fty_b, fdur, layup, cpt = mat_identify(mid)
+    t = min(bdf.properties[pid].dim)
+    
+    try:
+        w = max(bdf.properties[pid].dim)
+    except:
+        w = "n/a"
+    
+    ply = round(t / cpt)
+    n1, n2, n3, n4 = get_plies(ply, layup)
+    core_mat, core_t = "n/a", "n/a"
+    klass = get_component_class(pid)
+    
+    # Determine crippling section
+    crippling_section = "n/a"
+    if isinstance(w, (int, float)):
+        crippling_section = "Single Flange" if w <= 40 else "Double Flange"
+    
+    append_to_storage(
+        prop_type="PBARL",
+        pid=pid,
+        mid=mid,
+        mid_name=mid_name,
+        t=t,
+        w=w,
+        n1=n1, n2=n2, n3=n3, n4=n4,
+        lengths=lengths,
+        core_mat=core_mat,
+        core_t=core_t,
+        ftu_a=ftu_a, fty_a=fty_a,
+        ftu_b=ftu_b, fty_b=fty_b,
+        fdur=fdur,
+        klass=klass,
+        crippling_section=crippling_section
+    )
+    
+    pbarl_list.append(pid)
+    pshell_list.append(pid)
+
+
+def append_to_storage(prop_type, pid, mid, mid_name, t, w, n1, n2, n3, n4,
+                     lengths, core_mat, core_t, ftu_a, fty_a, ftu_b, fty_b,
+                     fdur, klass, crippling_section):
+    """Append property data to storage dictionary"""
+    storage["Type"].append(prop_type)
+    storage["Property ID"].append(pid)
+    storage["MAT ID"].append(mid)
+    storage["MAT"].append(mid_name)
+    storage["T"].append(t)
+    storage["Core MAT"].append(core_mat)
+    storage["Core T"].append(core_t)
+    storage["W"].append(w)
+    storage["n1"].append(n1)
+    storage["n2"].append(n2)
+    storage["n3"].append(n3)
+    storage["n4"].append(n4)
+    storage["aoff (deg)"].append(0)
+    storage["X-Length (mm)"].append(lengths[0])
+    storage["Y-Length (mm)"].append(lengths[1])
+    storage["Dhole (mm)"].append(0)
+    storage["... "].append("")
+    storage["Crippling Section"].append(crippling_section)
+    storage["Ftu (A-basis)"].append(ftu_a)
+    storage["Fty (A-basis)"].append(fty_a)
+    storage["Ftu (B-basis)"].append(ftu_b)
+    storage["Fty (B-basis)"].append(fty_b)
+    storage["Fdur"].append(fdur)
+    storage["Class"].append(klass)
+    storage["Unloaded edges"].append("Simply Supported")
+    storage["Loaded edges"].append("Simply Supported")
+    storage["CAI fwidth"].append(DEFAULT_STIFFENER_FLANGE)
+    storage["X Boundary (Ritz)"].append("SS")
+    storage["Y Boundary (Ritz)"].append("SS")
+    storage["Edge restraint (Ritz)"].append("Percent Fixity")
+    storage["Percent Fixity (Ritz)"].append(50)
+    storage["..."].append("")
+    is_skin = len(str(pid)) >= 3 and str(pid)[2] in [PID_UPPER_SKIN, PID_LOWER_SKIN]
+    storage["Offset"].append("YES" if is_skin else "NO")
+
+
+def process_joint_data(bdf, PBARL_ll, PSHELL_ll, pid2eid, df_general):
+    """Process joint data between PBARL and PSHELL"""
+    df_pbarl_pshell = get_BarShell_intersection(bdf, PBARL_ll, PSHELL_ll)
+    
+    storage_list = []
+    for i, row in df_pbarl_pshell.iterrows():
+        pbarl = df_pbarl_pshell["Property ID (PBARL)"][i]
+        pshell = df_pbarl_pshell["Property ID"][i]
+        elements = pid2eid[pbarl]
+        
+        for el in elements:
+            # Determine side based on property ID
+            side = "TAIL" if str(pbarl)[2] in [PID_SUBSTRU_A, PID_SUBSTRU_B] else "HEAD"
+            
+            # Default values (will be updated later)
+            storage_list.append((
+                pshell, pbarl, el,
+                None,  # Pin
+                None,  # Collar
+                None,  # Diameter
+                side,
+                5,     # Pitch (default)
+                2,     # Shim (default)
+                "Multiple row",  # Application
+                "YES"  # Prying
+            ))
+    
+    df_pbarl_pshell = pd.DataFrame(
+        storage_list,
+        columns=["Property ID", "Property ID (PBARL)", "Element ID (PBARL)",
+                "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim",
+                "Application", "Prying"]
+    )
+    
+    df_join = pd.merge(df_pbarl_pshell, df_general, on="Property ID", how="inner")
+    
+    # Update W (width) from PBARL properties
+    df_join["W (PBARL)"] = df_join["Property ID (PBARL)"].apply(
+        lambda x: max(bdf.properties[x].dim) if isinstance(x, int) else x
+    )
+    
+    # Update application based on width
+    df_join["Application"] = df_join["W (PBARL)"].apply(
+        lambda x: "Single row" if x <= 50 else "Multiple row"
+    )
+    
+    # Update pin, collar, diameter, and shim
+    update_pin_collar_properties(df_join)
+    
+    # Reorganize columns to align with GENERAL sheet structure
+    # Move Property ID between Prying and Type, add blank column after Prying
+    joint_columns = [
+        "Property ID (PBARL)", "Element ID (PBARL)", "W (PBARL)",
+        "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim",
+        "Application", "Prying"
+    ]
+    
+    # Add blank column after Prying
+    df_join["..."] = ""
+    # df_join.drop(df_join.columns[-7:], inplace=True, axis=1)
+    
+    # Add Property ID after blank column
+    joint_columns_final = [
+        "Property ID (PBARL)", "Element ID (PBARL)", "W (PBARL)",
+        "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim",
+        "Application", "Prying", "...", "Type", "Property ID", "MAT ID", "MAT", "T",
+        "W","n1","n2","n3","n4","aoff (deg)"
+    ]
+    
+    df_join = df_join[joint_columns_final]
+    
+    return df_join
+
+
+def pin_diameter(width):
+    """Determine pin diameter based on width"""
+    if width <= 43:
+        return 4.17
+    elif width <= 52:
+        return 4.78
+    elif width <= 61:
+        return 6.35
+    elif width <= 71:
+        return 7.92
+    elif width <= 80:
+        return 9.53
+    elif width <= 87:
+        return 11.13
+    elif width <= 99:
+        return 12.7
+    else:
+        return 14.3
+
+
+def shim_thickness(diameter):
+    """Determine shim thickness based on pin diameter"""
+    shim_map = {
+        4.17: 1.2,
+        4.78: 1.2,
+        6.35: 1.6,
+        7.92: 2.0
+    }
+    return shim_map.get(diameter, 2)
+
+
+def update_pin_collar_properties(df_join):
+    """Update pin, collar, diameter, and shim properties for joints"""
+    df_join["Diameter"] = df_join["W (PBARL)"].apply(pin_diameter)
+    
+    for i, row in df_join.iterrows():
+        pid = df_join["Property ID"][i]
+        dia = df_join["Diameter"][i]
+        pid_str = str(pid)
+        pid_digit = pid_str[2] if len(pid_str) >= 3 else None
+        
+        # Determine pin, collar, and shim based on property ID and diameter
+        if pid_digit == PID_LOWER_SKIN:  # Lower skin
+            if dia <= 9.53:
+                pin, collar = "ELS320", "EN2182ND"
+            else:
+                pin, collar = "HST 646", "STR20K"
+            shim = 2
+            
+        elif pid_digit == PID_UPPER_SKIN:  # Upper skin
+            pin, collar = "BG2082", "Not Applicable"
+            shim = 2
+            
+        elif pid_digit in [PID_OTHER, PID_SUBSTRU_A, PID_SUBSTRU_B]:  # Substructure
+            pin, collar = "ELS420", "EN2182ND"
+            shim = shim_thickness(dia)
+            
+        else:  # All others
+            pin, collar = "BG2082", "Not Applicable"
+            shim = shim_thickness(dia)
+        
+        df_join.at[i, "Pin"] = pin
+        df_join.at[i, "Collar"] = collar
+        df_join.at[i, "Shim"] = shim
+
+
+def update_boundary_conditions(df_general, df_join):
+    """Update CAI fwidth and boundary conditions based on joint data"""
+    def bar_width(pid):
+        try:
+            widths = df_join[df_join["Property ID"] == pid]["W (PBARL)"]
+            if widths.empty:
+                return DEFAULT_STIFFENER_FLANGE
+            # Filter out very small widths (likely errors)
+            valid_widths = [w for w in widths if w > 2]
+            if valid_widths:
+                return max(valid_widths)
+            return max(widths)
+        except:
+            return DEFAULT_STIFFENER_FLANGE
+    
+    df_general["CAI fwidth"] = df_general["Property ID"].apply(bar_width)
+    df_general["Unloaded edges"] = df_general["CAI fwidth"].apply(
+        lambda x: "50% Fixity" if x > 40 else "Simply Supported"
+    )
+    df_general["Y Boundary (Ritz)"] = df_general["CAI fwidth"].apply(
+        lambda x: "CC" if x > 40 else "SS"
+    )
+    
+    return df_general
+
+
+def parse_bdf_stats(bdf, bdf_path, misc_path=None):
+    """Extract only relevant sections from bdf stats and add metadata"""
+    raw = bdf.get_bdf_stats()
+    
+    # Keywords to keep
+    keep_sections = ["bdf.elements", "bdf.properties", "bdf.materials", "bdf.nodes"]
+    
+    filtered_lines = []
+    capture = False
+    for line in raw.split('\n'):
+        stripped = line.strip()
+        if any(stripped.startswith(k) for k in keep_sections):
+            capture = True
+        elif stripped.startswith("bdf.") and not any(stripped.startswith(k) for k in keep_sections):
+            capture = False
+        if capture and stripped:
+            filtered_lines.append(stripped)
+    
+    stats_text = "\n".join(filtered_lines)
+    
+    # Metadata
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bdf_path = os.path.abspath(bdf_path)
+    misc_info = os.path.abspath(misc_path) if misc_path else "N/A"
+    
+    # Metadata
+    try:
+        user = os.getlogin()
+    except:
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "Unknown"
+    
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    metadata = (
+        f"User       : {user}\n"
+        f"Generated  : {now}\n"
+        f"BDF File   : {os.path.abspath(bdf_path)}\n"
+        f"{'─'*60}\n"
+        f"{stats_text}"
+    )
+    
+    return metadata
+
+
+def write_output_excel(folder, file_name, df_general, df_join, bdf_path, misc_path=None):
+    """Write output Excel file with all sheets"""
+    out_path = os.path.join(folder, f"{file_name}_misc.xlsx")
+    
+    stats_text = parse_bdf_stats(bdf, bdf_path, misc_path)
+    df_stats = pd.DataFrame({"MODEL INFO": [stats_text]})
+    
+    try:
+        writer = pd.ExcelWriter(out_path, engine='xlsxwriter')
+        df_general.to_excel(writer, sheet_name="GENERAL", index=False)
+        df_join.to_excel(writer, sheet_name="JOINT", index=False)
+        df_stats.to_excel(writer, sheet_name="INFO", index=False)   # renamed from STATS
+        
+        # Format INFO sheet
+        ws = writer.sheets["INFO"]
+        wb = writer.book
+        wrap_format = wb.add_format({
+            'text_wrap': True,
+            'font_name': 'Consolas',
+            'font_size': 9,
+            'valign': 'top'
+        })
+        ws.set_column("A:A", 65, wrap_format)
+        ws.set_row(1, 200)  # tall row to show all content
+        
+        writer.close()
+    except Exception as e:
+        result_label.config(text="ERROR about output file!", fg="Firebrick")
+        print(f"ERROR - {e}")
+        raise
+
+
+# =============================================================================
+# MATERIAL IDENTIFICATION
+# =============================================================================
+def mat_identify(mid, oh=False):
+    """Identify material properties based on material ID"""
+    layup = DEFAULT_LAYUP.copy()
+    ftu_a = fty_a = ftu_b = fty_b = fdur = "n/a"
+    
+    material_props = {
+        MAT_PH13_8: {
+            'name': "PH13-8 Mo H1000 Bar (L,LT)  (< 8.0 in.)",
+            'ftu_a': 1385.69, 'fty_a': 1309.86,
+            'ftu_b': 1433.952, 'fty_b': 1378.8,
+            'fdur': 272.9 if oh else 329,
+            'cpt': 0.1
+        },
+        MAT_2050_T84: {
+            'name': "2050-T84 (L,LT,45)  (3.0-4.0 in.)",
+            'ftu_a': 475.79, 'fty_a': 434.32,
+            'ftu_b': 482.58, 'fty_b': 441.22,
+            'fdur': 100 if oh else 156,
+            'cpt': 0.1
+        },
+        MAT_2024_T3_CLAD: {
+            'name': "2024-T3 (L,LT)  (0.016-0.325 in.) Clad Sheet",
+            'ftu_a': 421, 'fty_a': 276,
+            'ftu_b': 427, 'fty_b': 290,
+            'fdur': 68 if oh else 106,
+            'cpt': 0.1
+        },
+        MAT_TI_6AL_4V: {
+            'name': "Ti-6Al-4V Annealed Bar (L,LT)  (4.0-5.0 in.)",
+            'ftu_a': 861.75, 'fty_a': 785.92,
+            'ftu_b': 903.11, 'fty_b': 820.39,
+            'fdur': 173.3 if oh else 303,
+            'cpt': 0.1
+        },
+        MAT_AS4C_M21_A: {
+            'name': "AS4c/M21 T2 285 g/m^2",
+            'cpt': 0.31
+        },
+        MAT_AS4C_M21_B: {
+            'name': "AS4c/M21 T2 285 g/m^2",
+            'cpt': 0.31
+        },
+        MAT_AS4C_M21_C: {
+            'name': "AS4c/M21 T2 285 g/m^2",
+            'cpt': 0.31
+        },
+        MAT_IM7_M91_A: {
+            'name': "IM7/M91 194 g/m^2",
+            'cpt': 0.184
+        },
+        MAT_IM7_M91_B: {
+            'name': "IM7/M91 194 g/m^2",
+            'layup': [0.4, 0.2, 0.2, 0.2],
+            'cpt': 0.184
+        },
+        MAT_QUARTZ: {
+            'name': "Quartz/8552 8HS 285 g/m^2",
+            'cpt': 0.29
+        }
+    }
+    
+    # Get material properties or use default
+    props = material_props.get(mid, {
+        'name': "IM7/M91 194 g/m^2",
+        'cpt': 0.184
+    })
+    
+    mid_name = props['name']
+    ftu_a = props.get('ftu_a', ftu_a)
+    fty_a = props.get('fty_a', fty_a)
+    ftu_b = props.get('ftu_b', ftu_b)
+    fty_b = props.get('fty_b', fty_b)
+    fdur = props.get('fdur', fdur)
+    layup = props.get('layup', layup)
+    cpt = props['cpt']
+    
+    return mid_name, ftu_a, fty_a, ftu_b, fty_b, fdur, layup, cpt
+
+
+# =============================================================================
+# PLY CALCULATION
+# =============================================================================
+def get_plies(ply, layup):
+    """Calculate ply distribution based on total plies and layup"""
+    if ply % 4 == 0:
+        n1 = math.ceil(ply * layup[0])
+        n2 = math.ceil(ply * layup[1])
+        n3 = math.ceil(ply * layup[2])
+        n4 = math.floor(ply * layup[3])
+    elif ply % 4 == 1:
+        mod_ply = ply - 1
+        n1 = math.ceil(mod_ply * layup[0]) + 1
+        n2 = math.ceil(mod_ply * layup[1])
+        n3 = math.ceil(mod_ply * layup[2])
+        n4 = math.floor(mod_ply * layup[3])
+    elif ply % 4 == 2:
+        n1 = math.ceil(ply * layup[0])
+        n2 = math.ceil(ply * layup[1]) + 1
+        n3 = math.ceil(ply * layup[2]) + 1
+        n4 = math.floor(ply * layup[3])
+    else:  # ply % 4 == 3
+        mod_ply = ply - 3
+        n1 = math.ceil(mod_ply * layup[0]) + 1
+        n2 = math.floor(mod_ply * layup[1]) + 1
+        n3 = math.floor(mod_ply * layup[2]) + 1
+        n4 = math.ceil(mod_ply * layup[3])
+    
+    # Balance plies to match total
+    plies_dict = {1: n1, 2: n2, 3: n3, 4: n4}
+    current_sum = sum(plies_dict.values())
+    
+    # Add missing plies
+    idx = 1
+    while current_sum < ply:
+        if idx == 0:
+            idx = 1
+            continue
+        plies_dict[idx] += 1
+        current_sum += 1
+        idx = (idx % 4) + 1
+    
+    # Remove excess plies (from the end)
+    idx = 1
+    while current_sum > ply:
+        if idx == 0:
+            idx = 1
+            continue
+        key = 4 - idx + 1
+        if plies_dict[key] > 0:
+            plies_dict[key] -= 1
+            current_sum -= 1
+        idx = (idx % 4) + 1
+    
+    return plies_dict[1], plies_dict[2], plies_dict[3], plies_dict[4]
+
+
+# =============================================================================
+# BAR-SHELL INTERSECTION
+# =============================================================================
+def get_BarShell_intersection(bdf, given_bar, given_shell):
+    """Find intersections between PBARL and PSHELL/PCOMP properties"""
+    storage = []
+    
+    for elid, element in bdf.elements.items():
+        prop = bdf.properties[element.pid]
+        if prop.type in ["PCOMP", "PSHELL", "PBARL"]:
+            for node in element.node_ids:
+                storage.append({
+                    'Type': prop.type,
+                    "Property ID": element.pid,
+                    "Node": node
+                })
+    
+    df = pd.DataFrame(storage)
+    df_comp = df[(df["Type"] == "PSHELL") | (df["Type"] == "PCOMP")]
+    df_bar = df[df["Type"] == "PBARL"]
+    
+    df_merge = pd.merge(df_comp, df_bar, on="Node", suffixes=('_PSHELL', '_PBARL'))
+    cols = ["Property ID_PSHELL", "Property ID_PBARL"]
+    shared_nodes_count = df_merge.groupby(cols).size().reset_index(name='Shared Nodes')
+    
+    df_pshell_pbarl = shared_nodes_count[shared_nodes_count['Shared Nodes'] >= 2]
+    df_pshell_pbarl = df_pshell_pbarl.drop("Shared Nodes", axis=1)
+    df_pshell_pbarl = df_pshell_pbarl.rename(
+        columns={
+            "Property ID_PSHELL": "Property ID",
+            "Property ID_PBARL": "Property ID (PBARL)"
+        }
+    )
+    
+    return df_pshell_pbarl
+
+
+# =============================================================================
+# BDF UPDATE FUNCTION
+# =============================================================================
+def update_bdf():
+    """Update BDF file with properties from misc Excel file"""
+    path = Path(file_entry.get())
+    bdf = my_read_bdf(path)
+    if bdf is None:
+        result_label.config(text="ERROR", fg='#ff4444')
+        return 1
+    
+    folder = os.path.dirname(path)
+    os.chdir(folder)
+    file_name = os.path.split(path)[-1].replace(".BDF", "").replace(".bdf", "").replace("_updated", "")
+    
+    try:
+        df_misc = pd.read_excel(file_entry2.get(), sheet_name="GENERAL")
+    except Exception as e:
+        result_label.config(text="ERROR", fg='#ff4444')
+        root.update_idletasks()
+        print(f"ERROR - {e}")
+        return 1
+    
+    result_label.config(text="UPDATING...", fg="black")
+    root.update_idletasks()
+    
+    # Update properties
+    for r in range(df_misc.shape[0]):
+        pid = int(df_misc["Property ID"].loc[r])
+        mat = int(df_misc["MAT ID"].loc[r])
+        t = float(df_misc["T"].loc[r])
+        w = float(df_misc["W"].loc[r])
+        
+        prop_type = bdf.properties[pid].type
+        
+        if prop_type == "PCOMP":
+            t_list = [t]
+            Tref = bdf.properties[pid].TRef
+            Theta = bdf.properties[pid].thetas
+            Sout = bdf.properties[pid].souts
+            SB = bdf.properties[pid].sb
+            del bdf.properties[pid]
+            bdf.add_pcomp(pid, [mat], t_list, thetas=Theta, souts=Sout, sb=SB, tref=Tref)
+            
+        elif prop_type == "PSHELL":
+            del bdf.properties[pid]
+            bdf.add_pshell(pid, mat, t, mid2=mat, mid3=mat)
+        
+        elif prop_type == "PBARL":
+            del bdf.properties[pid]
+            bdf.add_pbarl(pid, mat, Type="BAR", dim=[t, w])
+    
+    # SHELL OFFSET !
+    for r in range(df_misc.shape[0]):
+        pid = int(df_misc["Property ID"].loc[r])
+        offset_flag = str(df_misc["Offset"].loc[r]).strip().upper()
+        
+        if offset_flag == "YES":
+            prop = bdf.properties[pid]
+            prop_type = prop.type
+            
+            try:
+                # Get thickness
+                if prop_type == "PCOMP":
+                    t = prop.thicknesses[0]
+                elif prop_type == "PSHELL":
+                    t = prop.t
+                else:
+                    # PBARL or anything else — skip silently
+                    print(f"  [SKIP] PID {pid} is {prop_type} — zoffset not applicable.")
+                    continue
+                
+                # Apply zoffset to all elements of this property
+                pid2eid = bdf.get_property_id_to_element_ids_map()
+                for elid in pid2eid[pid]:
+                    try:
+                        bdf.elements[elid].zoffset = t * -0.5
+                    except Exception as e:
+                        print(f"  [SKIP] EID {elid} (PID {pid}) — {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"  [SKIP] PID {pid} — {e}")
+                continue
+    
+    bdf.write_bdf(f"{file_name}_updated.bdf")
+    
+    result_label.config(text="DONE !", fg=colors['fg_green'],font=('Consolas', 10, 'bold'))
+    root.update_idletasks()
+
+# =============================================================================
+# BDF READING FUNCTION
+# =============================================================================
+def my_read_bdf(bdf_filename):
+    """Read BDF file with error handling"""
+    try:
+        model = read_bdf(bdf_filename, xref=False, punch=False, debug=False)
+        return model
+    except:
+        try:
+            model = read_bdf(bdf_filename, xref=False, punch=False, debug=False, encoding='latin1')
+            return model
+        except:
+            pass
+    
+    try:
+        model = read_bdf(bdf_filename, xref=False, punch=True, debug=False)
+        return model
+    except:
+        try:
+            model = read_bdf(bdf_filename, xref=False, punch=True, debug=False, encoding='latin1')
+            return model
+        except:
+            result_label.config(text="ERROR about .bdf file!", fg="Firebrick")
+            root.update_idletasks()
+            return None
+
+
+# =============================================================================
+# PANEL DIMENSIONS CALCULATION
+# =============================================================================
+def get_panel_dimensions(pid):
+    """Calculate panel dimensions using PCA"""
+    if check1.get() != 1:
+        return ["n/a", "n/a"]
+    
+    pid2eid = bdf.get_property_id_to_element_ids_map()
+    elements = [bdf.elements[eid] for eid in pid2eid[pid]]
+    all_nodes = list(set([nid for element in elements for nid in element.nodes]))
+    coords = np.array([bdf.nodes[nid].xyz for nid in all_nodes])
+    
+    def get_plane_normal(coords):
+        """Calculate plane normal using PCA"""
+        if len(coords) < 3:
+            return np.array([0, 0, 1])
+        
+        centered = coords - np.mean(coords, axis=0)
+        pca = PCA(n_components=3)
+        pca.fit(centered)
+        
+        normal = pca.components_[-1]
+        if normal[2] < 0:
+            normal = -normal
+        
+        return normal / np.linalg.norm(normal)
+    
+    def project_to_plane(coords, normal):
+        """Project 3D coordinates to 2D plane"""
+        global_x = np.array([1, 0, 0])
+        local_x = global_x - np.dot(global_x, normal) * normal
+        
+        if np.linalg.norm(local_x) < 1e-6:
+            global_y = np.array([0, 1, 0])
+            local_x = global_y - np.dot(global_y, normal) * normal
+        
+        local_x = local_x / np.linalg.norm(local_x)
+        local_y = np.cross(normal, local_x)
+        
+        centered = coords - np.mean(coords, axis=0)
+        return np.column_stack([np.dot(centered, local_x), np.dot(centered, local_y)])
+    
+    def find_corner_nodes(positions):
+        """Find corner nodes of the panel"""
+        x_coords = positions[:, 0]
+        y_coords = positions[:, 1]
+        
+        x_min, x_max = np.min(x_coords), np.max(x_coords)
+        y_min, y_max = np.min(y_coords), np.max(y_coords)
+        
+        corners = []
+        corner_positions = [
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max]
+        ]
+        
+        for corner_pos in corner_positions:
+            distances = np.sum((positions - corner_pos)**2, axis=1)
+            closest_idx = np.argmin(distances)
+            corners.append(positions[closest_idx])
+        
+        return corners
+    
+    normal = get_plane_normal(coords)
+    plane_coords = project_to_plane(coords, normal)
+    corners = find_corner_nodes(plane_coords)
+    
+    if len(corners) == 0:
+        print("ERROR - No corners found.")
+        return ["n/a", "n/a"]
+    
+    # Calculate midpoints
+    midpoints = []
+    for i in range(len(corners)):
+        p1 = np.array(corners[i])
+        p2 = np.array(corners[(i + 1) % len(corners)])
+        mid = (p1 + p2) / 2
+        midpoints.append(mid)
+    
+    # Calculate lengths
+    lengths = []
+    for i in range(2):  # Only need X and Y
+        p1 = np.array(midpoints[i])
+        p2 = np.array(midpoints[(i + 2) % len(midpoints)])
+        length = np.linalg.norm(p2 - p1)
+        lengths.append(length)
+    
+    # Generate plot if requested
+    if panel_plot:
+        plot_dir = os.path.join(os.getcwd(), f"{file_name}_PanelPlots")
+        os.makedirs(plot_dir, exist_ok=True)
+        
+        corners_np = np.array(list(corners) + [corners[0]])
+        midpoints_np = np.array(midpoints)
+        
+        text = f"PID: {pid}\nY: {lengths[0]:.2f} | X: {lengths[1]:.2f}"
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(corners_np[:, 0], corners_np[:, 1], 'bo-', linewidth=2, markersize=8, label="Corners")
+        plt.plot(midpoints_np[:, 0], midpoints_np[:, 1], 'rx', linewidth=2, markersize=8, label="Mids")
+        
+        plt.title(text)
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.gca().set_aspect('equal')
+        plt.grid(True, alpha=0.4)
+        plt.legend()
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(plot_dir, f'PID_{pid}.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    return lengths
+
+
+def switch_panel_dimensions():
+    """Toggle panel dimensions calculation and plotting"""
+    global panel_plot
+    
+    if check1.get() == 1:
+        user_answer = messagebox.askquestion("Panel plots", "Would you like to get panel plots also?")
+        panel_plot = (user_answer == "yes")
+        print(f"PANEL PLOT: {'ON' if panel_plot else 'OFF'}\n")
+
+
+# =============================================================================
+# GUI FUNCTIONS
+# =============================================================================
+def browse_file():
+    """Browse for BDF file"""
+    file_path = filedialog.askopenfilename(
+        initialdir="/",
+        title="Select a File",
+        filetypes=(("Nastran file", "*.bdf*"), ("all files", "*.*"))
+    )
+    
+    if file_path:
+        file_entry.delete(0, tk.END)
+        file_entry.insert(0, file_path)
+        
+        file_entry2.delete(0, tk.END)
+        file_entry2.config(state=tk.DISABLED, disabledbackground='#0f0f0f')
+        split_btn3.config(state=tk.DISABLED)
+        
+        result_label.config(text="FILE LOADED...", fg='#ffaa00')
+
+
+def browse_file2():
+    """Browse for misc Excel file"""
+    file_path = filedialog.askopenfilename(
+        initialdir="/",
+        title="Select a File",
+        filetypes=(("Misc file", "*.xlsx*"), ("all files", "*.*"))
+    )
+    
+    if file_path:
+        file_entry2.config(state=tk.NORMAL)
+        file_entry2.delete(0, tk.END)
+        file_entry2.insert(0, file_path)
+        split_btn3.config(state=tk.NORMAL)
+        result_label.config(text="FILE LOADED...", fg='#ffaa00')
+
+
+def center_window(window):
+    """Center window on screen"""
+    window.update_idletasks()
+    width = window.winfo_width()
+    height = window.winfo_height()
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = (screen_width - width) // 2
+    y = (screen_height - height) // 2
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def apply_hev_theme():
+    """Apply Half-Life HEV Suit theme - minimal version"""
+    # Colors
+    BG_DARK = "#0a0a0a"
+    BG_MED = "#1a1a1a"
+    BG_LIGHT = "#2a2a2a"
+    ORANGE = "#ff6600"
+    ORANGE_HOVER = "#ff8800"
+    GREEN = "#00ff00"
+    GRAY = "#aaaaaa"
+    DISABLED = "#555555"
+    BORDER = "#444444"
+    
+    # Configure ttk style
+    style = ttk.Style()
+    style.theme_use('clam')
+    
+    # Button style
+    style.configure('TButton',
+                   background=BG_LIGHT,
+                   foreground=ORANGE_HOVER,
+                   bordercolor=ORANGE,
+                   lightcolor=BG_LIGHT,
+                   darkcolor=BG_LIGHT,
+                   font=('Consolas', 9, 'bold'),
+                   borderwidth=1,
+                   focuscolor=ORANGE)
+    
+    style.map('TButton',
+              background=[('active', '#3a3a3a'), ('pressed', ORANGE)],
+              foreground=[('active', '#ffaa00'), ('pressed', BG_DARK)])
+    
+    # Checkbutton style
+    style.configure('TCheckbutton',
+                   background=BG_DARK,
+                   foreground=GRAY,
+                   font=('Consolas', 9))
+    
+    style.map('TCheckbutton',
+              foreground=[('active', ORANGE_HOVER)])
+    
+    # Return color dict for manual widget styling
+    return {
+        'bg': BG_DARK,
+        'bg_med': BG_MED,
+        'bg_light': BG_LIGHT,
+        'fg': GRAY,
+        'fg_orange': ORANGE_HOVER,
+        'fg_green': GREEN,
+        'border': BORDER,
+        'orange': ORANGE,
+        'disabled': DISABLED
+    }
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+if __name__ == "__main__":
+    # Initialize the GUI
+    root = tk.Tk()
+    root.title("MISGEN3071 - HEV INTERFACE")
+    root.geometry("450x280")
+    
+    # Apply HEV theme
+    colors = apply_hev_theme()
+    root.configure(bg=colors['bg'])
+    root.resizable(False, False)
+    center_window(root)
+    
+    # BDF file selection
+    file_label0 = tk.Label(root, text="NASTRAN .BDF FILE", 
+                          bg=colors['bg'], fg=colors['fg_orange'], 
+                          font=('Consolas', 9, 'bold'))
+    file_label0.place(x=15, y=10)
+    
+    file_entry = tk.Entry(root, width=42, font=('Consolas', 9),
+                         bg=colors['bg_med'], fg=colors['fg_green'],
+                         insertbackground=colors['fg_green'],
+                         selectbackground=colors['orange'],
+                         relief='flat', highlightthickness=1,
+                         highlightbackground=colors['border'],
+                         highlightcolor=colors['orange'])
+    file_entry.place(x=15, y=35, width=320, height=26)
+    
+    file_label = tk.Button(root, text="BROWSE", command=browse_file,
+                          bg=colors['bg_light'], fg=colors['fg_orange'],
+                          font=('Consolas', 9, 'bold'), relief='flat',
+                          borderwidth=1, highlightthickness=1,
+                          highlightbackground=colors['orange'],
+                          activebackground=colors['orange'],
+                          activeforeground=colors['bg'], cursor='hand2')
+    file_label.place(x=350, y=35, width=85, height=26)
+    
+    # Misc file selection
+    result_label2 = tk.Label(root, text="MISC .XLSX FILE", 
+                            bg=colors['bg'], fg=colors['fg_orange'],
+                            font=('Consolas', 9, 'bold'))
+    result_label2.place(x=15, y=75)
+    
+    file_entry2 = tk.Entry(root, width=42, font=('Consolas', 9),
+                          bg=colors['bg_med'], fg=colors['fg_green'],
+                          insertbackground=colors['fg_green'],
+                          selectbackground=colors['orange'],
+                          relief='flat', highlightthickness=1,
+                          highlightbackground=colors['border'],
+                          highlightcolor=colors['orange'],
+                          disabledbackground='#0f0f0f',
+                          disabledforeground=colors['disabled'])
+    file_entry2.place(x=15, y=100, width=320, height=26)
+    file_entry2.config(state=tk.DISABLED)
+    
+    file_label2 = tk.Button(root, text="BROWSE", command=browse_file2,
+                           bg=colors['bg_light'], fg=colors['fg_orange'],
+                           font=('Consolas', 9, 'bold'), relief='flat',
+                           borderwidth=1, highlightthickness=1,
+                           highlightbackground=colors['orange'],
+                           activebackground=colors['orange'],
+                           activeforeground=colors['bg'], cursor='hand2')
+    file_label2.place(x=350, y=100, width=85, height=26)
+    
+    # Panel dimensions checkbox
+    panel_plot = False
+    check1 = tk.BooleanVar()
+    check_btn = tk.Checkbutton(root, text="PANEL DIMENSIONS", 
+                              bg=colors['bg'], fg=colors['fg'],
+                              activebackground=colors['bg'],
+                              selectcolor=colors['bg'],
+                              font=('Consolas', 9),
+                              command=switch_panel_dimensions, 
+                              var=check1)
+    check_btn.place(x=15, y=145)
+    
+    # Status label
+    result_label = tk.Label(root, text="WAITING...", 
+                       fg="#ffaa00", bg=colors['bg'],
+                       font=('Consolas', 10, 'bold'), width=20)
+    result_label.place(relx=0.5, y=190, anchor='center')
+    
+    # Buttons - all same width (135px)
+    split_btn2 = tk.Button(root, text="CANCEL", command=root.destroy,
+                          bg=colors['bg_light'], fg=colors['fg_orange'],
+                          font=('Consolas', 9, 'bold'), relief='flat',
+                          borderwidth=1, highlightthickness=1,
+                          highlightbackground=colors['orange'],
+                          activebackground=colors['orange'],
+                          activeforeground=colors['bg'], cursor='hand2')
+    split_btn2.place(x=15, y=230, width=135, height=32)
+    
+    split_btn3 = tk.Button(root, text="UPDATE", command=update_bdf,
+                          bg=colors['bg_light'], fg=colors['fg_orange'],
+                          font=('Consolas', 9, 'bold'), relief='flat',
+                          borderwidth=1, highlightthickness=1,
+                          highlightbackground=colors['orange'],
+                          activebackground=colors['orange'],
+                          activeforeground=colors['bg'], cursor='hand2')
+    split_btn3.place(x=157, y=230, width=135, height=32)
+    split_btn3.config(state=tk.DISABLED)
+    
+    split_btn = tk.Button(root, text="GET MISC", command=main,
+                         bg=colors['bg_light'], fg='#ffaa00',
+                         font=('Consolas', 10, 'bold'), relief='flat',
+                         borderwidth=2, highlightthickness=2,
+                         highlightbackground='#ff8800',
+                         activebackground=colors['orange'],
+                         activeforeground=colors['bg'], cursor='hand2')
+    split_btn.place(x=299, y=230, width=136, height=32)
+    
+    # Banner
+    banner = """
+--------------------------------------------------------------
+
+ _|      _|  _|_|_|    _|_|_|    _|_|_|  _|_|_|_|  _|      _|  
+ _|_|  _|_|    _|    _|        _|        _|        _|_|    _|  
+ _|  _|  _|    _|      _|_|    _|  _|_|  _|_|_|    _|  _|  _|  
+ _|      _|    _|          _|  _|    _|  _|        _|    _|_|  
+ _|      _|  _|_|_|  _|_|_|      _|_|_|  _|_|_|_|  _|      _|  
+
+--------------------------------------------------------------
+"""
+    print(banner)
+    
+    root.mainloop()
