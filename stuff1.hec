@@ -1,0 +1,196 @@
+def write_stuff(sheet_name, df_out, df_out_final, dt):
+    global ttb_path, misc_path, tatobin_path
+    import platform
+
+    # RF statistics
+    rf_col = "RF" if "RF" in df_out_final.columns else "RF Combined"
+    rf_numeric = pd.Series(dtype=float)
+    rf_stats = {}
+    worst_props = {}
+    quality_stats = {}
+    df_dist = pd.DataFrame()
+
+    if rf_col in df_out_final.columns:
+        rf_numeric = pd.to_numeric(df_out_final[rf_col], errors="coerce").dropna()
+        
+        if len(rf_numeric) > 0:
+            rf_stats = {
+                "RF Min"            : f"{rf_numeric.min():.3f}",
+                "RF Max"            : f"{rf_numeric.max():.3f}",
+                "RF Mean"           : f"{rf_numeric.mean():.3f}",
+                "RF Std Dev"        : f"{rf_numeric.std():.3f}",
+                "Failed (RF<1.0)"   : int((rf_numeric < 1.0).sum()),
+                "Marginal (RF<1.2)" : int(((rf_numeric >= 1.0) & (rf_numeric < 1.2)).sum()),
+                "Passed (RF>=1.2)"  : int((rf_numeric >= 1.2).sum()),
+                "Total Rows"        : len(rf_numeric),
+                "Pass Rate (%)"     : f"{(rf_numeric >= 1.0).sum() / len(rf_numeric) * 100:.1f}%",
+            }
+
+            # worst 5 properties
+            if "Property ID" in df_out_final.columns:
+                df_temp = df_out_final.copy()
+                df_temp[rf_col] = pd.to_numeric(df_temp[rf_col], errors="coerce")
+                worst = df_temp.nsmallest(5, rf_col)
+                for rank, (_, row) in enumerate(worst.iterrows(), start=1):
+                    lcid = row.get("Subcase ID", "n/a")
+                    pid  = row.get("Property ID", "n/a")
+                    rf   = row[rf_col]
+                    worst_props[f"Top {rank} Worst PID"] = f"PID={pid} | LCID={lcid} | RF={rf:.3f}"
+
+            # RF distribution
+            bins   = [(-float("inf"), 0.5), (0.5, 0.8), (0.8, 1.0),
+                      (1.0, 1.2), (1.2, 1.5), (1.5, float("inf"))]
+            labels = ["< 0.5", "0.5-0.8", "0.8-1.0", "1.0-1.2", "1.2-1.5", "> 1.5"]
+            counts = []
+            pcts   = []
+            for lo, hi in bins:
+                cnt = int(((rf_numeric > lo) & (rf_numeric <= hi)).sum())
+                counts.append(cnt)
+                pcts.append(f"{cnt / len(rf_numeric) * 100:.1f}%")
+
+            df_dist = pd.DataFrame({
+                "RF Range"   : labels,
+                "Count"      : counts,
+                "Percentage" : pcts,
+            })
+
+    # data quality
+    if df_out_final is not None and len(df_out_final) > 0:
+        total      = len(df_out_final)
+        null_count = int(df_out_final.isnull().sum().sum())
+        quality_stats = {
+            "Total Rows"    : total,
+            "Null Values"   : null_count,
+            "Null Rate (%)" : f"{null_count / (total * len(df_out_final.columns)) * 100:.2f}%",
+            "Unique PIDs"   : df_out_final["Property ID"].nunique() if "Property ID" in df_out_final.columns else "n/a",
+            "Unique LCIDs"  : df_out_final["Subcase ID"].nunique() if "Subcase ID" in df_out_final.columns else "n/a",
+        }
+
+    # build metadata
+    separator = {"Parameter": "---", "Value": "---"}
+
+    meta_rows = []
+
+    if rf_stats:
+        meta_rows.append({"Parameter": "=== RF Statistics ===", "Value": ""})
+        for k, v in rf_stats.items():
+            meta_rows.append({"Parameter": k, "Value": v})
+
+    if worst_props:
+        meta_rows.append({"Parameter": "=== Top 5 Worst Properties ===", "Value": ""})
+        for k, v in worst_props.items():
+            meta_rows.append({"Parameter": k, "Value": v})
+
+    if quality_stats:
+        meta_rows.append({"Parameter": "=== Data Quality ===", "Value": ""})
+        for k, v in quality_stats.items():
+            meta_rows.append({"Parameter": k, "Value": v})
+
+    meta_rows.append({"Parameter": "=== Run Info ===", "Value": ""})
+    run_info = {
+        "Delta Time (seconds)" : f"{dt:.2f}",
+        "Processing Date"      : datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "User"                 : os.getlogin(),
+        "Machine"              : platform.node(),
+        "Python Version"       : platform.python_version(),
+        "Toolbox File"         : os.path.basename(ttb_path) if ttb_path else "n/a",
+        "Misc File"            : os.path.basename(misc_path) if misc_path else "n/a",
+    }
+    for k, v in run_info.items():
+        meta_rows.append({"Parameter": k, "Value": v})
+
+    metadata = pd.DataFrame(meta_rows)
+
+    # file naming
+    sheet_name  = sheet_name.replace(" ", "")
+    file_name   = datetime.datetime.now().strftime(f"{sheet_name}_%H%M%S-%d%m%Y")
+    os.chdir(tatobin_path)
+
+    try:
+        df_out_final.dropna(subset="Property ID", inplace=True)
+    except:
+        pass
+
+    def get_min_rf_per_property(df, rf_col="RF"):
+        try:
+            return df.loc[df.groupby("Property ID")[rf_col].idxmin()].reset_index(drop=True)
+        except Exception as e:
+            print(f"WARNING: Could not extract min RF for '{rf_col}': {e}")
+            return pd.DataFrame()
+
+    is_cbj       = "cbj" in sheet_name.lower() and "ML" not in sheet_name
+    is_crippling = "crippling" in sheet_name.lower()
+    use_chunk    = chunk_check_var.get()
+
+    if use_chunk:
+        csv_file  = f"TTB_{file_name}.csv"
+        xlsx_file = f"TTB_{file_name}_summary.xlsx"
+        df_out_final.to_csv(csv_file, index=False)
+        print(f"Full data saved as CSV -> {csv_file}")
+    else:
+        csv_file  = None
+        xlsx_file = f"TTB_{file_name}.xlsx"
+
+    with pd.ExcelWriter(xlsx_file) as writer:
+        if is_cbj:
+            for col in ["RF", "RFcombined", "RFnet"]:
+                if col in df_out_final.columns:
+                    df_out_final[col] = df_out_final[col].fillna(0)
+                    df_out_final[col] = df_out_final[col].apply(
+                        lambda x: 0 if isinstance(x, str) else x)
+
+            df_rf    = get_min_rf_per_property(df_out_final, "RF")
+            df_rf2_1 = get_min_rf_per_property(df_out_final, "RFcombined")
+            df_rf2_2 = get_min_rf_per_property(df_out_final, "RFnet")
+            df_rf2   = pd.concat([df_rf2_1, df_rf2_2], ignore_index=True)
+
+            if not use_chunk:
+                df_out_final.to_excel(writer, sheet_name=sheet_name, index=False)
+            if not df_rf.empty:
+                df_rf.to_excel(writer, sheet_name="RF min", index=False)
+            if not df_rf2.empty:
+                df_rf2.to_excel(writer, sheet_name="RF min 2", index=False)
+
+        else:
+            default_val = 1000 if is_crippling else 0
+
+            if rf_col in df_out_final.columns:
+                df_out_final[rf_col] = df_out_final[rf_col].fillna(default_val)
+                df_out_final[rf_col] = df_out_final[rf_col].apply(
+                    lambda x: default_val if isinstance(x, str) else x)
+                df_rf = get_min_rf_per_property(df_out_final, rf_col)
+
+                if not use_chunk:
+                    df_out_final.to_excel(writer, sheet_name=sheet_name, index=False)
+                if not df_rf.empty:
+                    df_rf.to_excel(writer, sheet_name="RF min", index=False)
+            else:
+                print("WARNING: No RF column found in results")
+                if not use_chunk:
+                    df_out_final.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # info sheet
+        metadata.to_excel(writer, sheet_name="Info", index=False)
+
+        # RF distribution sheet
+        if not df_dist.empty:
+            df_dist.to_excel(writer, sheet_name="RF Distribution", index=False)
+
+    # rogue copy
+    rogue_path_xlsx = os.path.join(
+        "//vds/alldept3/Analiz_T5200/T52G0/T24505/9001_trainingdata",
+        f"TTB_{file_name}-{os.getlogin()}.xlsx"
+    )
+    rogue_path_csv = os.path.join(
+        "//vds/alldept3/Analiz_T5200/T52G0/T24505/9001_trainingdata",
+        f"TTB_{file_name}-{os.getlogin()}.csv"
+    )
+    try:
+        shutil.copy2(xlsx_file, rogue_path_xlsx)
+        if use_chunk and csv_file:
+            shutil.copy2(csv_file, rogue_path_csv)
+    except:
+        pass
+
+    print(f"Summary Excel -> {xlsx_file}\n")
+    return 0
