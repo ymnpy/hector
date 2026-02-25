@@ -1,0 +1,280 @@
+import queue
+import threading
+import shutil
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def startup_workers(n_workers, ttb_path):
+    """Copy toolbox n times, open each, return queue of (wb, temp_path)"""
+    worker_queue = queue.Queue()
+    base_dir = os.path.dirname(ttb_path)
+    base_name = os.path.splitext(os.path.basename(ttb_path))[0]
+    ext = os.path.splitext(ttb_path)[1]
+    
+    print(f"Starting {n_workers} Excel workers...")
+    
+    for i in range(n_workers):
+        try:
+            temp_path = os.path.join(base_dir, f"{base_name}_worker{i+1}{ext}")
+            shutil.copy2(ttb_path, temp_path)
+            
+            app = xw.App(visible=False)
+            app.api.Calculation = xw.constants.Calculation.xlCalculationManual
+            app.screen_updating = False
+            app.display_alerts = False
+            app.enable_events = False
+            wb = app.books.open(temp_path)
+            
+            worker_queue.put((wb, temp_path))
+            print(f"  Worker {i+1} ready -> {os.path.basename(temp_path)}")
+            
+        except Exception as e:
+            print(f"  ERROR: Could not start worker {i+1}: {e}")
+    
+    actual = worker_queue.qsize()
+    print(f"{actual}/{n_workers} workers started successfully.")
+    return worker_queue
+
+
+def shutdown_workers(worker_queue):
+    """Close all excel instances and delete temp copies"""
+    print("Shutting down workers...")
+    
+    while not worker_queue.empty():
+        try:
+            wb, temp_path = worker_queue.get_nowait()
+            try:
+                wb.app.api.Calculation = xw.constants.Calculation.xlCalculationAutomatic
+                wb.app.screen_updating = True
+                wb.close()
+                wb.app.quit()
+            except Exception as e:
+                print(f"  WARNING: Could not close Excel cleanly: {e}")
+            
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    print(f"  Deleted -> {os.path.basename(temp_path)}")
+            except Exception as e:
+                print(f"  WARNING: Could not delete {temp_path}: {e}")
+                
+        except queue.Empty:
+            break
+    
+    print("All workers shut down.")
+
+
+def open_worker_excel(temp_path):
+    """Open a fresh excel instance for a temp toolbox copy"""
+    app = xw.App(visible=False)
+    app.api.Calculation = xw.constants.Calculation.xlCalculationManual
+    app.screen_updating = False
+    app.display_alerts = False
+    app.enable_events = False
+    wb = app.books.open(temp_path)
+    return wb
+
+
+def run_chunked_parallel(rf_func, worker_queue, n_workers, df_join, *args, **kwargs):
+    """
+    Parallel wrapper around rf_func.
+    Splits df_join into chunks, distributes across worker excel instances.
+    rf_func is called directly per chunk.
+    """
+    
+    # check if function is chunk unsafe
+    CHUNK_UNSAFE_FUNCS = {rf_ils, rf_sandwich, rf_pflutter}
+    if rf_func in CHUNK_UNSAFE_FUNCS:
+        print(f"  INFO: {rf_func.__name__} is not chunk-safe, "
+              f"running as single batch on one worker.")
+        wb, temp_path = worker_queue.get()
+        try:
+            sig = inspect.signature(rf_func)
+            params = list(sig.parameters.keys())
+            has_rows = "rows" in params
+            if has_rows:
+                result = rf_func(wb, len(df_join), df_join, *args, **kwargs)
+            else:
+                result = rf_func(wb, df_join, *args, **kwargs)
+            return result
+        finally:
+            worker_queue.put((wb, temp_path))
+    
+    # get chunk size
+    chunk_size = get_validated_chunk_size()
+    if chunk_size is None:
+        return None
+    
+    chunks = [df_join.iloc[i:i+chunk_size].reset_index(drop=True)
+              for i in range(0, len(df_join), chunk_size)]
+    total_chunks = len(chunks)
+    
+    print(f"Parallel run: {total_chunks} chunks across {n_workers} workers")
+    
+    results = [None] * total_chunks  # preserve order
+    lock = threading.Lock()
+
+    def process_chunk(chunk_idx, chunk):
+        wb, temp_path = worker_queue.get()  # blocks until worker available
+        attempt = 0
+        
+        while attempt < 3:
+            try:
+                with lock:
+                    print(f"  Chunk {chunk_idx+1}/{total_chunks} -> "
+                          f"{os.path.basename(temp_path)} (attempt {attempt+1})")
+                
+                sig = inspect.signature(rf_func)
+                params = list(sig.parameters.keys())
+                has_rows = "rows" in params
+                
+                if has_rows:
+                    result = rf_func(wb, len(chunk), chunk, *args, **kwargs)
+                else:
+                    result = rf_func(wb, chunk, *args, **kwargs)
+                
+                worker_queue.put((wb, temp_path))  # return worker
+                return chunk_idx, result
+            
+            except Exception as e:
+                attempt += 1
+                with lock:
+                    print(f"  ERROR chunk {chunk_idx+1}, "
+                          f"attempt {attempt}/3: {e}")
+                
+                # try to recover excel
+                try:
+                    wb.close()
+                    wb.app.quit()
+                except:
+                    pass
+                
+                if attempt < 3:
+                    try:
+                        time.sleep(2 ** attempt)
+                        wb = open_worker_excel(temp_path)
+                        with lock:
+                            print(f"  Worker recovered for chunk {chunk_idx+1}")
+                    except Exception as re:
+                        with lock:
+                            print(f"  ERROR: Could not recover worker: {re}")
+                        try:
+                            worker_queue.put((wb, temp_path))
+                        except:
+                            pass
+                        return chunk_idx, None
+                else:
+                    # all 3 attempts failed, put fresh wb back
+                    try:
+                        wb = open_worker_excel(temp_path)
+                        worker_queue.put((wb, temp_path))
+                    except:
+                        pass
+                    return chunk_idx, None
+        
+        return chunk_idx, None
+    
+    # run chunks in parallel, track wall clock time
+    wall_start = time.time()
+    
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(process_chunk, i, chunk): i
+                   for i, chunk in enumerate(chunks)}
+        
+        for future in as_completed(futures):
+            try:
+                chunk_idx, result = future.result()
+                if result is not None:
+                    results[chunk_idx] = result
+                    sheet_name, df_out, dt = result
+                    with lock:
+                        print(f"  Chunk {chunk_idx+1}/{total_chunks} "
+                              f"done in {dt:.2f}s")
+                else:
+                    with lock:
+                        print(f"  WARNING: Chunk {chunk_idx+1} "
+                              f"failed all attempts, skipping.")
+            except Exception as e:
+                with lock:
+                    print(f"  ERROR in future: {e}")
+    
+    wall_time = time.time() - wall_start
+
+    # collect results in order
+    valid_results = [r for r in results if r is not None]
+    if not valid_results:
+        print("ERROR: All chunks failed.")
+        return None
+    
+    sheet_name = valid_results[0][0]
+    df_combined = pd.concat([r[1] for r in valid_results], ignore_index=True)
+    
+    print(f"Parallel run complete. "
+          f"Wall time: {wall_time:.2f}s, "
+          f"Total rows: {len(df_combined)}")
+    
+    return sheet_name, df_combined, wall_time
+
+
+# GUI addition - place next to chunk widgets in tab1
+worker_label = tk.Label(tab1, text="Workers:", font="Verdana 8")
+worker_label.place(x=305, y=165)
+
+worker_var = tk.IntVar(value=1)
+worker_dropdown = ttk.Combobox(tab1, textvariable=worker_var,
+                                values=[1,2,3,4,5,6,7,8],
+                                width=3, state="readonly")
+worker_dropdown.place(x=363, y=165, height=20)
+
+
+# main() structure
+def main():
+    worker_queue = None
+    n_workers = worker_var.get()
+    
+    try:
+        # ... existing file reading code ...
+        
+        if chunk_check_var.get() and n_workers > 1:
+            worker_queue = startup_workers(n_workers, ttb_path)
+        
+        # each analysis block follows this pattern:
+        if c1.get():
+            try:
+                if worker_queue is not None:
+                    result = run_chunked_parallel(
+                        rf_unnotched, worker_queue, n_workers, dfc_shell_all)
+                elif chunk_check_var.get():
+                    result = run_chunked(
+                        rf_unnotched, ttb_wb, dfc_shell_all)
+                else:
+                    result = rf_unnotched(
+                        ttb_wb, len(dfc_shell_all), dfc_shell_all)
+                
+                if result is None:
+                    raise Exception("returned None")
+                sheet_name, df_out, dt = result
+                df_addition = dfc_shell_all[
+                    ["Element ID","Property ID","Subcase ID"]].reset_index(drop=True)
+                df_out = df_out.reset_index(drop=True)
+                df_out_final = pd.concat((df_addition, df_out), axis=1)
+                write_stuff(sheet_name, df_out, df_out_final, dt)
+                write_log(sheet_name, dt, state=1)
+                
+            except Exception as e:
+                print(f"ERROR - Unnotched: {e}")
+            
+            count += 1
+            progress_bar['value'] = 100*(count-1)/check_vars
+
+        # ... rest of analyses same pattern ...
+
+    except Exception as e:
+        print(f"ERROR in main: {e}")
+        result_label.config(text="ERROR", fg="red", font="Colossal 9")
+        run_button.config(state=tk.NORMAL)
+        
+    finally:
+        if worker_queue is not None:
+            shutdown_workers(worker_queue)
