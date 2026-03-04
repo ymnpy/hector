@@ -1,0 +1,220 @@
+import time
+import psutil
+import xlwings as xw
+
+# =============================================================================
+# HEALTH STATE  (module level, no class needed)
+# =============================================================================
+
+_com_errors_recent = []   # list of timestamps
+_last_refresh_chunk = -1  # which chunk was last refreshed
+
+
+def record_com_error():
+    _com_errors_recent.append(time.time())
+
+
+def should_refresh(chunk_index, com_error_threshold=3, com_error_window=5, mem_threshold_mb=1500):
+    """Returns (bool, reason_str)."""
+
+    if chunk_index == _last_refresh_chunk:
+        return False, "already refreshed this chunk"
+
+    # signal 1: COM error spike
+    now = time.time()
+    recent = [t for t in _com_errors_recent if now - t <= com_error_window]
+    if len(recent) >= com_error_threshold:
+        return True, f"COM spike: {len(recent)} errors in {com_error_window}s"
+
+    # signal 2: Excel memory pressure
+    for proc in psutil.process_iter(['name', 'memory_info']):
+        try:
+            if 'excel' in proc.info['name'].lower():
+                mem_mb = proc.info['memory_info'].rss / (1024 * 1024)
+                if mem_mb > mem_threshold_mb:
+                    return True, f"Excel memory {mem_mb:.0f}MB > {mem_threshold_mb}MB"
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return False, None
+
+
+def mark_refreshed(chunk_index):
+    global _last_refresh_chunk
+    _last_refresh_chunk = chunk_index
+    _com_errors_recent.clear()
+
+
+def reset_health():
+    global _last_refresh_chunk
+    _com_errors_recent.clear()
+    _last_refresh_chunk = -1
+
+
+# =============================================================================
+# WORKBOOK REFRESH
+# =============================================================================
+
+def refresh_workbook(wb, wb_path):
+    print("  [refresh] reopening workbook...")
+    try:
+        wb.close()
+    except Exception as e:
+        print(f"  [refresh] close failed: {e}")
+
+    time.sleep(2)
+    wb = xw.Book(wb_path)
+
+    try:
+        wb.app.api.Calculation = xw.constants.Calculation.xlCalculationManual
+        wb.app.screen_updating = False
+        wb.app.display_alerts  = False
+        wb.app.enable_events   = False
+    except Exception as e:
+        print(f"  [refresh] could not re-apply settings: {e}")
+
+    print("  [refresh] done")
+    return wb
+
+
+# =============================================================================
+# SAFE CALCULATE
+# =============================================================================
+
+def safe_calculate(wb, timeout=60):
+    """Waits for Excel to finish calculating before returning."""
+    wb.app.calculate()
+    start = time.time()
+    while True:
+        try:
+            if wb.app.api.CalculationState == 0:  # xlDone
+                break
+        except Exception:
+            break
+        if time.time() - start > timeout:
+            print(f"  WARNING: safe_calculate timed out after {timeout}s")
+            break
+        time.sleep(0.05)
+
+
+# =============================================================================
+# FILLDOWN  (replaces AutoFill everywhere)
+# =============================================================================
+
+def filldown(ws, start_row, end_row, start_col, end_col):
+    ws.range(f"{start_col}{start_row}:{end_col}{end_row}").api.FillDown()
+
+
+# =============================================================================
+# CLEAR RANGE
+# =============================================================================
+
+def clear_range_dynamic(ws, start_row, start_col, end_col):
+    last_row = ws.range(f"{start_col}{ws.cells.last_cell.row}").end('up').row
+    if last_row >= start_row:
+        ws.range(f"{start_col}{start_row}:{end_col}{last_row}").api.Delete()
+    else:
+        ws.range(f"{start_col}{start_row}:{end_col}{start_row + 1}").api.Delete()
+
+
+# =============================================================================
+# RUN CHUNKED
+# =============================================================================
+
+def run_chunked(rf_func, wb, df_join, *args, ttb_path=None, **kwargs):
+    import inspect
+    import pandas as pd
+
+    CHUNK_UNSAFE = {rf_ils, rf_sandwich, rf_pflutter}
+    if rf_func in CHUNK_UNSAFE:
+        print(f"  INFO: {rf_func.__name__} not chunk-safe, running as single batch")
+        has_rows = "rows" in inspect.signature(rf_func).parameters
+        if has_rows:
+            return rf_func(wb, len(df_join), df_join, *args, **kwargs)
+        else:
+            return rf_func(wb, df_join, *args, **kwargs)
+
+    try:
+        chunk_size = int(chunk_entry_var.get())
+        assert chunk_size > 0
+    except:
+        print("ERROR: invalid chunk size")
+        return None
+
+    def lock_excel(wb):
+        try:
+            wb.app.api.Calculation = xw.constants.Calculation.xlCalculationManual
+            wb.app.screen_updating = False
+            wb.app.display_alerts  = False
+            wb.app.enable_events   = False
+        except:
+            pass
+
+    has_rows     = "rows" in inspect.signature(rf_func).parameters
+    chunks       = [df_join.iloc[i:i+chunk_size] for i in range(0, len(df_join), chunk_size)]
+    total_chunks = len(chunks)
+    all_results  = []
+    total_dt     = 0
+    sheet_name   = None
+
+    reset_health()
+
+    for i, chunk in enumerate(chunks):
+        print(f"  Chunk {i+1}/{total_chunks} -> {len(chunk)} rows")
+        chunk = chunk.reset_index(drop=True)
+
+        # dynamic refresh check
+        ok, reason = should_refresh(chunk_index=i)
+        if ok:
+            print(f"  [health] chunk {i+1}: {reason}")
+            if ttb_path:
+                wb = refresh_workbook(wb, ttb_path)
+                mark_refreshed(chunk_index=i)
+            else:
+                print("  [health] ttb_path missing, skipping refresh")
+
+        lock_excel(wb)
+
+        result = None
+        for attempt in range(3):
+            try:
+                if has_rows:
+                    result = rf_func(wb, len(chunk), chunk, *args, **kwargs)
+                else:
+                    result = rf_func(wb, chunk, *args, **kwargs)
+                break
+
+            except Exception as e:
+                err_str = str(e)
+                is_com  = any(c in err_str for c in [
+                    "-2147352567", "-2147417842", "-2147418113",
+                    "exception occurred", "call was rejected", "microsoft excel"
+                ])
+                record_com_error()
+
+                if is_com and attempt < 2:
+                    wait = 2 ** attempt
+                    print(f"  COM error chunk {i+1} attempt {attempt+1}/3, retry in {wait}s: {err_str[:100]}")
+                    time.sleep(wait)
+                    lock_excel(wb)
+                else:
+                    print(f"  ERROR: chunk {i+1} failed: {err_str[:200]}")
+                    result = None
+                    break
+
+        if result is None:
+            print(f"  WARNING: chunk {i+1} skipped")
+            continue
+
+        sheet_name, df_out, dt = result
+        all_results.append(df_out)
+        total_dt += dt
+        print(f"  Chunk {i+1}/{total_chunks} done in {dt:.2f}s")
+
+    if not all_results:
+        print("ERROR: all chunks returned None")
+        return None
+
+    df_combined = pd.concat(all_results, ignore_index=True)
+    print(f"  Total: {total_dt:.2f}s, Rows: {len(df_combined)}")
+    return sheet_name, df_combined, total_dt
