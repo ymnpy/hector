@@ -1,0 +1,2443 @@
+"""
+MISGEN — Interactive Structural Viewer
+Cleaned, optimized, dynamic column support
+"""
+
+"""
+TODO
+FIX CUSTOM COLUMNS
+ADD SOME FEATURES
+REMOVE ELEMENT EDGES
+
+"""
+
+import os, sys
+os.environ['QT_API']            = 'pyqt5'
+os.environ['QT_OPENGL']         = 'software'
+os.environ['PYVISTA_USE_PANEL'] = '0'
+os.environ['PYVISTA_OFF_SCREEN']= 'false'
+os.environ['VTK_USE_OFFSCREEN'] = '0'
+
+import vtk
+vtk.vtkObject.GlobalWarningDisplayOff()
+
+from pyNastran.bdf.bdf import read_bdf
+import pandas as pd
+import numpy as np
+import math, warnings, re, io
+warnings.filterwarnings('ignore')
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QGroupBox, QComboBox,
+    QFileDialog, QSplitter, QTextEdit,
+    QRadioButton, QSlider, QFrame, QSizePolicy,
+    QActionGroup, QMessageBox
+)
+from PyQt5.QtCore import Qt, QTimer
+
+
+try:
+    import pyvista as pv
+    from pyvistaqt import QtInteractor
+    PYVISTA_AVAILABLE = True
+except ImportError:
+    PYVISTA_AVAILABLE = False
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+DEFAULT_STIFFENER_FLANGE = 40
+DEFAULT_CORE_MAT         = "HRH-36-4.0-96 Core"
+DEFAULT_LAYUP            = [0.25, 0.25, 0.25, 0.25]
+
+# Property ID digit-2 codes
+PID_UPPER_SKIN = '1'
+PID_LOWER_SKIN = '2'
+PID_SUBSTRU_A  = '3'
+PID_SUBSTRU_B  = '4'
+PID_OTHER      = '0'
+
+# Material IDs used in mat_db
+MAT_TI_6AL_4V  = 110000
+MAT_AS4C_M21_A = 132000
+MAT_IM7_M91_A  = 230003
+MAT_IM7_M91_B  = 230004
+
+# Columns that are always in GENERAL (built-in, non-dynamic)
+BUILTIN_GENERAL_COLS = {
+    "Property ID", "Type", "T", "W", "Core T", "Core MAT", "Class",
+    "n1", "n2", "n3", "n4", "Ftu (A-basis)", "Fty (A-basis)",
+    "CAI fwidth", "Crippling Section",
+    "Percent Fixity (Ritz)", "X Boundary (Ritz)", "Y Boundary (Ritz)",
+}
+
+# Columns that are always in JOINT (built-in, non-dynamic)
+BUILTIN_JOINT_COLS = {
+    "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim", "Application", "Prying",
+}
+
+# =============================================================================
+# THEMES
+# =============================================================================
+THEMES = {
+    "Default": {
+        "shell":        "#6B7585",
+        "bar":          "#E85D00",
+        "panel_bg":     "#E4E7EC",
+        "group_bg":     "#F0F2F5",
+        "group_border": "#C8CDD6",          # FIX: was duplicated; kept meaningful value
+        "group_title":  "#E85D00",
+        "text":         "#1A2030",
+        "dim":          "#6B7585",
+        "input_bg":     "#FFFFFF",
+        "input_border": "#C8CDD6",
+        "btn_bg":       "#FFFFFF",
+        "btn_border":   "#C8CDD6",
+        "btn_hover":    "#E85D00",
+        "btn_hover_txt":"#FFFFFF",
+        "log_bg":       "#E4E7EC",
+        "log_text":     "#29c73e",
+        "log_border":   "#E85D00",
+        "status_ok":    "#007A4D",
+        "status_warn":  "#C07000",
+        "status_err":   "#C0001A",
+        "accent":       "#E85D00",
+        "menubar_bg":   "#E85D00",
+        "menubar_txt":  "#FFFFFF",
+        "menu_bg":      "#E85D00",
+        "menu_sel_bg":  "#E85D00",
+        "menu_sel_txt": "#FFFFFF",
+        "vp_bg_hex":    "#f8f9fb",
+        "axes_color":   "#555577",
+        "cmap":         "coolwarm",
+        "splitter_bg":  "#C8CDD6",
+        "legend_bg":    "#f8f9fb",
+        "discrete": ["#E85D00","#0088CC","#2AAA5A","#CC003A","#CC9900","#7B2FBE",
+                     "#008899","#E04000","#0055BB","#5D9900","#CC0077","#0099AA"],
+    },
+    "Light": {
+        "shell":        "#D0D0D0",
+        "bar":          "#1E88E5",
+        "panel_bg":     "#F5F5F5",
+        "group_bg":     "#FFFFFF",
+        "group_border": "#D0D0D0",
+        "group_title":  "#1E88E5",
+        "text":         "#202124",
+        "dim":          "#888888",
+        "input_bg":     "#FFFFFF",
+        "input_border": "#C0C0C0",
+        "btn_bg":       "#FFFFFF",
+        "btn_border":   "#C0C0C0",
+        "btn_hover":    "#1E88E5",
+        "btn_hover_txt":"#FFFFFF",
+        "log_bg":       "#EEF4FF",
+        "log_text":     "#1a237e",
+        "log_border":   "#1E88E5",
+        "status_ok":    "#2E7D32",
+        "status_warn":  "#E65100",
+        "status_err":   "#B71C1C",
+        "accent":       "#1E88E5",
+        "menubar_bg":   "#E8EAED",
+        "menubar_txt":  "#202124",
+        "menu_bg":      "#FFFFFF",
+        "menu_sel_bg":  "#E3F2FD",
+        "menu_sel_txt": "#202124",
+        "vp_bg_hex":    "#f0f0f0",
+        "axes_color":   "#333333",
+        "cmap":         "jet",
+        "splitter_bg":  "#D0D0D0",
+        "legend_bg":    "#f0f0f0",
+        "discrete": ["#1E88E5","#E53935","#43A047","#FB8C00","#8E24AA","#00ACC1",
+                     "#F4511E","#3949AB","#00897B","#C0CA33","#D81B60","#6D4C41"],
+    },
+    "Dark": {
+        "shell":        "#3E3E42",
+        "bar":          "#094771",
+        "panel_bg":     "#252526",
+        "group_bg":     "#1E1E1E",
+        "group_border": "#3E3E42",
+        "group_title":  "#007ACC",
+        "text":         "#CCCCCC",
+        "dim":          "#888888",
+        "input_bg":     "#2D2D30",
+        "input_border": "#3E3E42",
+        "btn_bg":       "#2D2D30",
+        "btn_border":   "#3E3E42",
+        "btn_hover":    "#007ACC",
+        "btn_hover_txt":"#FFFFFF",
+        "log_bg":       "#1A1A1A",
+        "log_text":     "#9CDCFE",
+        "log_border":   "#007ACC",
+        "status_ok":    "#4EC94E",
+        "status_warn":  "#FFCC00",
+        "status_err":   "#F44747",
+        "accent":       "#007ACC",
+        "menubar_bg":   "#1E1E1E",
+        "menubar_txt":  "#CCCCCC",
+        "menu_bg":      "#252526",
+        "menu_sel_bg":  "#094771",
+        "menu_sel_txt": "#CCCCCC",
+        "vp_bg_hex":    "#1e1e1e",
+        "axes_color":   "#CCCCCC",
+        "cmap":         "plasma",
+        "splitter_bg":  "#252526",
+        "legend_bg":    "#1e1e1e",
+        "discrete": ["#007ACC","#4EC94E","#F44747","#FFCC00","#CE9178","#9CDCFE",
+                     "#C586C0","#4FC1FF","#569CD6","#DCDCAA","#D7BA7D","#808080"],
+    },
+    "Ocean Blue": {
+        "shell":        "#4FC3F7",
+        "bar":          "#2E5266",
+        "panel_bg":     "#0D2137",
+        "group_bg":     "#1A3A52",
+        "group_border": "#2E5266",
+        "group_title":  "#4FC3F7",
+        "text":         "#E0E6ED",
+        "dim":          "#8899AA",
+        "input_bg":     "#132840",
+        "input_border": "#2E5266",
+        "btn_bg":       "#1A3A52",
+        "btn_border":   "#2E5266",
+        "btn_hover":    "#4FC3F7",
+        "btn_hover_txt":"#0D2137",
+        "log_bg":       "#091828",
+        "log_text":     "#4FC3F7",
+        "log_border":   "#2E5266",
+        "status_ok":    "#4FC3F7",
+        "status_warn":  "#FFB300",
+        "status_err":   "#EF5350",
+        "accent":       "#4FC3F7",
+        "menubar_bg":   "#0A1929",
+        "menubar_txt":  "#E0E6ED",
+        "menu_bg":      "#0D2137",
+        "menu_sel_bg":  "#4FC3F7",
+        "menu_sel_txt": "#0D2137",
+        "vp_bg_hex":    "#091828",
+        "axes_color":   "#E0E6ED",
+        "cmap":         "rainbow",
+        "splitter_bg":  "#0D2137",
+        "legend_bg":    "#0d2137",
+        "discrete": ["#4FC3F7","#FF8A65","#81C784","#FFD54F","#CE93D8","#4DD0E1",
+                     "#F48FB1","#AED581","#FFB74D","#90CAF9","#A5D6A7","#FFCC02"],
+    },
+    "Forest Green": {
+        "shell":        "#66BB6A",
+        "bar":          "#EF5350",
+        "panel_bg":     "#1B2E1F",
+        "group_bg":     "#2D4A32",
+        "group_border": "#3D5A42",
+        "group_title":  "#66BB6A",
+        "text":         "#D4E7D8",
+        "dim":          "#88AA8C",
+        "input_bg":     "#243529",
+        "input_border": "#3D5A42",
+        "btn_bg":       "#2D4A32",
+        "btn_border":   "#3D5A42",
+        "btn_hover":    "#66BB6A",
+        "btn_hover_txt":"#1B2E1F",
+        "log_bg":       "#141F17",
+        "log_text":     "#A5D6A7",
+        "log_border":   "#3D5A42",
+        "status_ok":    "#66BB6A",
+        "status_warn":  "#FFD54F",
+        "status_err":   "#EF5350",
+        "accent":       "#66BB6A",
+        "menubar_bg":   "#141F17",
+        "menubar_txt":  "#D4E7D8",
+        "menu_bg":      "#1B2E1F",
+        "menu_sel_bg":  "#66BB6A",
+        "menu_sel_txt": "#1B2E1F",
+        "vp_bg_hex":    "#141F17",
+        "axes_color":   "#D4E7D8",
+        "cmap":         "viridis",
+        "splitter_bg":  "#1B2E1F",           # FIX: was duplicated; kept darker value
+        "legend_bg":    "#1b2e1f",
+        "discrete": ["#66BB6A","#FFD54F","#EF5350","#42A5F5","#AB47BC","#26C6DA",
+                     "#FFA726","#8D6E63","#78909C","#EC407A","#26A69A","#D4E157"],
+    },
+    "Cyber": {
+        "shell":        "#1A1A2E",
+        "bar":          "#FF2D78",
+        "panel_bg":     "#0A0A14",
+        "group_bg":     "#12121F",
+        "group_border": "#FF2D78",
+        "group_title":  "#00F5FF",
+        "text":         "#E0E0FF",
+        "dim":          "#6060AA",
+        "input_bg":     "#0D0D1A",
+        "input_border": "#FF2D78",
+        "btn_bg":       "#12121F",
+        "btn_border":   "#00F5FF",
+        "btn_hover":    "#FF2D78",
+        "btn_hover_txt":"#0A0A14",
+        "log_bg":       "#070710",
+        "log_text":     "#00F5FF",
+        "log_border":   "#FF2D78",
+        "status_ok":    "#00F5FF",
+        "status_warn":  "#FFD700",
+        "status_err":   "#FF2D78",
+        "accent":       "#FF2D78",
+        "menubar_bg":   "#070710",
+        "menubar_txt":  "#00F5FF",
+        "menu_bg":      "#0A0A14",
+        "menu_sel_bg":  "#FF2D78",
+        "menu_sel_txt": "#0A0A14",
+        "vp_bg_hex":    "#070710",
+        "axes_color":   "#00F5FF",
+        "cmap":         "cool",
+        "splitter_bg":  "#FF2D78",
+        "legend_bg":    "#12121F",
+        "discrete": ["#FF2D78","#00F5FF","#FFD700","#BF00FF","#00FF9F",
+                     "#FF6B00","#0066FF","#FF0055","#00FFD1","#FF00AA",
+                     "#7700FF","#00FF44"],
+    },
+}
+
+
+def _is_sep(col: str) -> bool:
+    return col.startswith("──") or col == "Default View"
+
+
+def _build_left_qss(t: dict) -> str:
+    return f"""
+QWidget#LeftPanel {{
+    background-color: {t['panel_bg']};
+    border: none;
+}}
+QGroupBox {{
+    background-color: {t['group_bg']};
+    border: 1px solid {t['group_border']};
+    border-top: 3px solid {t['group_title']};
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 14px;
+    font-weight: bold;
+    font-size: 10px;
+    color: {t['text']};
+    letter-spacing: 1px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 5px;
+    background-color: {t['group_bg']};
+    color: {t['group_title']};
+}}
+QLabel {{
+    background-color: transparent;
+    color: {t['text']};
+    font-size: 11px;
+}}
+QLineEdit {{
+    background-color: {t['input_bg']};
+    border: 1px solid {t['input_border']};
+    border-radius: 4px;
+    padding: 5px 8px;
+    color: {t['text']};
+    font-size: 11px;
+}}
+QLineEdit:read-only {{ color: {t['dim']}; }}
+QLineEdit:focus {{ border-color: {t['accent']}; }}
+QPushButton {{
+    background-color: {t['btn_bg']};
+    border: 1px solid {t['btn_border']};
+    border-radius: 4px;
+    padding: 6px 14px;
+    color: {t['text']};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background-color: {t['btn_hover']};
+    color: {t['btn_hover_txt']};
+    border-color: {t['btn_hover']};
+}}
+QPushButton:pressed {{
+    background-color: {t['accent']};
+    color: {t['btn_hover_txt']};
+}}
+QPushButton:disabled {{
+    color: {t['dim']};
+    border-color: {t['group_border']};
+    background-color: {t['group_bg']};
+}}
+QPushButton:checked {{
+    background-color: {t['accent']};
+    color: {t['btn_hover_txt']};
+    border-color: {t['accent']};
+}}
+QComboBox {{
+    background-color: {t['input_bg']};
+    border: 1px solid {t['input_border']};
+    border-radius: 4px;
+    padding: 5px 8px;
+    color: {t['text']};
+    font-size: 11px;
+}}
+QComboBox:hover {{ border-color: {t['accent']}; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox::down-arrow {{
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 6px solid {t['dim']};
+    width: 0; height: 0; margin-right: 5px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {t['input_bg']};
+    color: {t['text']};
+    border: 1px solid {t['input_border']};
+    selection-background-color: {t['accent']};
+    selection-color: {t['btn_hover_txt']};
+    outline: none;
+}}
+QTextEdit {{
+    background-color: {t['log_bg']};
+    border: 1px solid {t['group_border']};
+    border-left: 3px solid {t['log_border']};
+    color: {t['log_text']};
+    font-family: 'Courier New', monospace;
+    font-size: 10px;
+    border-radius: 3px;
+}}
+QRadioButton {{
+    color: {t['text']};
+    font-size: 11px;
+    spacing: 5px;
+    background-color: transparent;
+}}
+QRadioButton::indicator {{
+    width: 13px; height: 13px;
+    border: 2px solid {t['group_border']};
+    border-radius: 7px;
+    background-color: {t['input_bg']};
+}}
+QRadioButton::indicator:checked {{
+    background-color: {t['accent']};
+    border-color: {t['accent']};
+}}
+QScrollBar:vertical {{
+    background: {t['panel_bg']}; width: 8px; border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {t['group_border']}; min-height: 20px; border-radius: 4px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {t['accent']}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+"""
+
+
+def _build_menubar_qss(t: dict) -> str:
+    return f"""
+QMenuBar {{
+    background-color: {t['menubar_bg']};
+    color: {t['menubar_txt']};
+    padding: 2px;
+    border-bottom: 1px solid {t['group_border']};
+    font-size: 11px;
+}}
+QMenuBar::item {{
+    background-color: transparent;
+    padding: 6px 14px;
+    color: {t['menubar_txt']};
+    border-radius: 3px;
+}}
+QMenuBar::item:selected {{
+    background-color: {t['menu_sel_bg']};
+    color: {t['menu_sel_txt']};
+}}
+QMenu {{
+    background-color: {t['menu_bg']};
+    color: {t['menubar_txt']};
+    border: 1px solid {t['group_border']};
+    border-radius: 4px;
+    padding: 4px 0;
+}}
+QMenu::item {{
+    padding: 7px 28px 7px 12px;
+    font-size: 11px;
+    color: {t['menubar_txt']};
+}}
+QMenu::item:selected {{
+    background-color: {t['menu_sel_bg']};
+    color: {t['menu_sel_txt']};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {t['group_border']};
+    margin: 3px 8px;
+}}
+"""
+
+
+def _build_bottombar_qss(t: dict) -> str:
+    return f"""
+QWidget#BottomBar {{
+    background-color: {t['panel_bg']};
+    border-top: 1px solid {t['group_border']};
+}}
+QLabel {{
+    color: {t['dim']};
+    font-size: 10px;
+    background-color: transparent;
+}}
+QComboBox {{
+    background-color: {t['input_bg']};
+    border: 1px solid {t['input_border']};
+    border-radius: 3px;
+    padding: 4px 8px;
+    color: {t['text']};
+    font-size: 10px;
+}}
+QComboBox::drop-down {{ border: none; width: 16px; }}
+QComboBox::down-arrow {{
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 5px solid {t['dim']};
+    width: 0; height: 0; margin-right: 4px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {t['input_bg']};
+    color: {t['text']};
+    border: 1px solid {t['input_border']};
+    selection-background-color: {t['accent']};
+    selection-color: {t['btn_hover_txt']};
+}}
+QPushButton#RenderBtn {{
+    background-color: {t['accent']};
+    color: {t['btn_hover_txt']};
+    border: none;
+    border-radius: 3px;
+    padding: 5px 12px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+QPushButton#RenderBtn:hover {{
+    background-color: {t['btn_bg']};        
+    color: {t['accent']};                   
+    border: 1px solid {t['accent']};        
+}}
+QPushButton#RenderBtn:pressed {{
+    background-color: {t['group_border']};
+    color: {t['accent']};
+}}
+QPushButton#LabelBtn {{
+    background-color: {t['btn_bg']};
+    color: {t['text']};
+    border: 1px solid {t['btn_border']};
+    border-radius: 3px;
+    padding: 5px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton#LabelBtn:hover {{
+    background-color: {t['btn_hover']};
+    color: {t['btn_hover_txt']};
+    border-color: {t['btn_hover']};
+}}
+QPushButton#LabelBtn:checked {{
+    background-color: {t['accent']};
+    color: {t['btn_hover_txt']};
+    border-color: {t['accent']};
+}}
+QSlider {{
+    background-color: transparent;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {t['group_border']};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {t['accent']};
+    width: 12px; height: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {t['accent']};
+    border-radius: 2px;
+}}
+QLabel#OpacityVal {{
+    color: {t['accent']};
+    font-weight: bold;
+    min-width: 30px;
+    font-size: 10px;
+    background: transparent;
+}}
+QLabel#PickStatus {{
+    background-color: transparent;
+    color: {t['accent']};
+    padding: 5px 4px;
+    border: none;
+    font-size: 10px;
+    font-weight: bold;
+    min-width: 0px;
+}}
+QFrame#BarSep {{
+    background-color: {t['group_border']};
+    max-width: 1px;
+}}
+"""
+
+
+# =============================================================================
+# MAIN APPLICATION
+# =============================================================================
+class MISGEN_App(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MISGEN — Interactive Structural Viewer")
+        self.setGeometry(60, 60, 1700, 950)
+        self.setMinimumSize(800, 500)
+
+        self.bdf             = None
+        self.df_general      = None
+        self.df_join         = None
+        self.df_stats        = None
+        self.bdf_path_str    = None
+        self.excel_path_str  = None
+
+        self.current_mesh        = None
+        self.current_pid_data    = None
+        self.current_eid_data    = None
+        self.current_column_data = None
+        self.pid_labels_actor    = None
+
+        self._eid_val_map    = {}
+        self._picking_active = False
+        self._selected_type  = None
+        self._pid_color_map  = {}
+        self._viz_actors     = []
+        self._current_col    = "Default View"
+        self._picked_actor = None
+        self._hidden_pids = set()
+
+        # Points / node-map cache — invalidated on BDF reload
+        self._pts_cache  = None
+        self._nmap_cache = None
+
+        self._theme_name = "Default"
+        self._theme      = THEMES["Default"]
+
+        self._init_ui()
+        self._apply_theme("Default")
+
+    # =========================================================================
+    # THEME
+    # =========================================================================
+    def _apply_theme(self, name: str):
+        if name not in THEMES:
+            return
+        self._theme_name = name
+        self._theme      = THEMES[name]
+        t = self._theme
+
+        self.left_panel.setStyleSheet(_build_left_qss(t))
+        self.menuBar().setStyleSheet(_build_menubar_qss(t))
+        self.bottom_bar.setStyleSheet(_build_bottombar_qss(t))
+
+        self.centralWidget().setStyleSheet(f"background-color: {t['panel_bg']};")
+        self._right_panel.setStyleSheet(f"background-color: {t['vp_bg_hex']};")
+        self._splitter.setStyleSheet(
+            f"QSplitter::handle {{ background-color: {t['splitter_bg']}; width: 2px; }}"
+        )
+
+        if self.plotter:
+            self.plotter.set_background(t["vp_bg_hex"])
+            try:
+                self.plotter.add_axes(color=t["axes_color"], viewport=(0.0, 0.0, 0.12, 0.15))
+            except Exception:
+                pass
+            self.plotter.render()
+
+        self._pid_color_map.clear()
+
+        if self.bdf:
+            col = self._current_col
+            if not _is_sep(col) and col and self.df_general is not None:
+                self._display_col()
+            else:
+                self._viz_default()
+
+    def _discrete_colors(self, unique_vals):
+        disc = self._theme["discrete"]
+        return {v: disc[i % len(disc)] for i, v in enumerate(unique_vals)}
+
+    def _pid_color(self, pid):
+        disc = self._theme["discrete"]
+        if pid not in self._pid_color_map:
+            self._pid_color_map[pid] = disc[len(self._pid_color_map) % len(disc)]
+        return self._pid_color_map[pid]
+
+    # =========================================================================
+    # UI BUILD
+    # =========================================================================
+    def _init_ui(self):
+        self._build_menubar()
+        main = QWidget()
+        self.setCentralWidget(main)
+        root = QHBoxLayout(main)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setHandleWidth(2)
+        root.addWidget(self._splitter)
+        self._splitter.addWidget(self._build_left())
+        self._splitter.addWidget(self._build_right())
+        self._splitter.setSizes([430, 1270])
+
+    # -------------------------------------------------------------------------
+    # MENU BAR
+    # -------------------------------------------------------------------------
+    def _build_menubar(self):
+        mb = self.menuBar()
+
+        fm = mb.addMenu("File")
+        a = fm.addAction("📁  Open BDF File…"); a.setShortcut("Ctrl+O")
+        a.triggered.connect(self._browse_bdf)
+        a = fm.addAction("📊  Open Excel File…")
+        a.triggered.connect(self._browse_excel)
+        fm.addSeparator()
+        a = fm.addAction("⬆  Export MISC Excel…")
+        a.triggered.connect(self._export_excel)
+        fm.addSeparator()
+        a = fm.addAction("❌  Exit"); a.setShortcut("Ctrl+Q")
+        a.triggered.connect(self.close)
+
+        vm = mb.addMenu("View")
+        a = vm.addAction("🔁  Refresh Visualization"); a.setShortcut("F5")
+        a.triggered.connect(self._re_render)
+        a = vm.addAction("🏠  Reset Camera")
+        a.triggered.connect(lambda: (self.plotter.reset_camera(), self.plotter.render()) if self.plotter else None)
+        vm.addSeparator()
+        a = vm.addAction("🏷  Toggle PID Labels")
+        a.triggered.connect(self._toggle_labels)
+
+        tm = mb.addMenu("Themes")
+        icons = {"Default": "⚙️", "Light": "☀️", "Dark": "🌙",
+         "Ocean Blue": "🌊", "Forest Green": "🌲", "Cyber": "⚡"}
+        grp = QActionGroup(self); grp.setExclusive(True)
+        for name in THEMES:
+            a = tm.addAction(f"{icons.get(name, '●')}  {name}")
+            a.setCheckable(True); a.setChecked(name == "Default")
+            a.triggered.connect(lambda checked, n=name: self._apply_theme(n))
+            grp.addAction(a)
+
+        am = mb.addMenu("About")
+        a = am.addAction("ℹ️  About MISGEN"); a.triggered.connect(self._show_about)
+        a = am.addAction("❓  Help");         a.triggered.connect(self._show_help)
+
+    # -------------------------------------------------------------------------
+    # LEFT PANEL
+    # -------------------------------------------------------------------------
+    def _build_left(self):
+        self.left_panel = QWidget()
+        self.left_panel.setObjectName("LeftPanel")
+        self.left_panel.setMaximumWidth(440)
+        lay = QVBoxLayout(self.left_panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # ── LOAD FILES ───────────────────────────────────────────────────────
+        load_g = QGroupBox("Load Files")
+        load_l = QVBoxLayout(); load_l.setSpacing(7)
+
+        load_l.addWidget(QLabel("BDF File:"))
+        bdf_row = QHBoxLayout()
+        self.bdf_label = QLineEdit("No file loaded"); self.bdf_label.setReadOnly(True)
+        bdf_btn = QPushButton("Browse"); bdf_btn.setFixedWidth(72)
+        bdf_btn.clicked.connect(self._browse_bdf)
+        bdf_row.addWidget(self.bdf_label); bdf_row.addWidget(bdf_btn)
+        load_l.addLayout(bdf_row)
+
+        load_l.addSpacing(2)
+        load_l.addWidget(QLabel("Excel File (MISC / Modified):"))
+        xl_row = QHBoxLayout()
+        self.xl_label = QLineEdit("Load or export a BDF first"); self.xl_label.setReadOnly(True)
+        self.xl_btn = QPushButton("Browse"); self.xl_btn.setFixedWidth(72)
+        self.xl_btn.clicked.connect(self._browse_excel); self.xl_btn.setEnabled(False)
+        xl_row.addWidget(self.xl_label); xl_row.addWidget(self.xl_btn)
+        load_l.addLayout(xl_row)
+
+        load_g.setLayout(load_l); lay.addWidget(load_g)
+
+        # ── PROPERTY FILTER ──────────────────────────────────────────────────
+        pf_g = QGroupBox("Property Filter")
+        pf_l = QVBoxLayout(); pf_l.setSpacing(6)
+
+        pf_l.addWidget(QLabel("Property IDs:"))
+        self.prop_input = QLineEdit("All")
+        self.prop_input.setPlaceholderText("All  |  1,2,3  |  10-20")
+        self.prop_input.returnPressed.connect(
+    lambda: self._easter_egg() if self.prop_input.text().strip().lower() == "triage" else self._re_render())
+        pf_l.addWidget(self.prop_input)
+
+        pf_l.addWidget(QLabel("Type filter:"))
+        self.type_radio_widget = QWidget()
+        self.type_radio_widget.setStyleSheet("background:transparent;")
+        self.type_radio_layout = QHBoxLayout(self.type_radio_widget)
+        self.type_radio_layout.setContentsMargins(0, 0, 0, 0); self.type_radio_layout.setSpacing(6)
+        self.type_radios = {}
+        for lbl in ["All", "PSHELL", "PCOMP", "PBARL"]:
+            rb = QRadioButton(lbl); rb.setChecked(lbl == "All")
+            if lbl != "All": rb.setEnabled(False)
+            rb.toggled.connect(lambda on, l=lbl: self._on_type_radio(l, on))
+            self.type_radios[lbl] = rb
+            self.type_radio_layout.addWidget(rb)
+        self.type_radio_layout.addStretch()
+        pf_l.addWidget(self.type_radio_widget)
+
+        pf_g.setLayout(pf_l); lay.addWidget(pf_g)
+
+        # ── EXPORT / REFRESH ─────────────────────────────────────────────────
+        lay.addSpacing(6)
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        self.export_btn = QPushButton("⬆  Export MISC")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_excel)
+
+        # "Refresh" now purely re-renders whatever column is currently displayed
+        self.refresh_btn = QPushButton("🔄  Refresh View")
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.clicked.connect(self._re_render)
+
+        btn_row.addWidget(self.export_btn); btn_row.addWidget(self.refresh_btn)
+        lay.addLayout(btn_row)
+        lay.addSpacing(6)
+
+        # ── STATUS ───────────────────────────────────────────────────────────
+        """
+        self.status_lbl = QLabel("Status: Ready")
+        self.status_lbl.setWordWrap(True)
+        lay.addWidget(self.status_lbl)
+
+        self.info_label = QLabel("Load a BDF file to begin.")
+        self.info_label.setWordWrap(True)
+        lay.addWidget(self.info_label)
+        """
+
+        # ── LOG ──────────────────────────────────────────────────────────────
+        lay.addStretch()
+        log_hdr_row = QHBoxLayout()
+        log_hdr = QLabel("Log")
+        log_hdr.setStyleSheet("font-weight:bold;font-size:10px;margin-top:4px;")
+        self.log_toggle_btn = QPushButton("▼")
+        self.log_toggle_btn.setFixedSize(20, 20)
+        self.log_toggle_btn.setToolTip("Collapse log")
+        self.log_toggle_btn.clicked.connect(self._toggle_log)
+        log_hdr_row.addWidget(log_hdr)
+        log_hdr_row.addStretch()
+        log_hdr_row.addWidget(self.log_toggle_btn)
+        lay.addLayout(log_hdr_row)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(600)
+        lay.addWidget(self.log_text, stretch=1)
+
+        return self.left_panel
+
+    # -------------------------------------------------------------------------
+    # RIGHT PANEL
+    # -------------------------------------------------------------------------
+    def _build_right(self):
+        self._right_panel = QWidget()
+        lay = QVBoxLayout(self._right_panel)
+        lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+
+        if PYVISTA_AVAILABLE:
+            try:
+                self.plotter = QtInteractor(self._right_panel)
+                self.plotter.set_background('#f8f9fb')
+                self.plotter.add_axes(color="#555577", viewport=(0.0, 0.0, 0.12, 0.15))
+                self.plotter.track_click_position(callback=self._on_click, side='right')
+            
+                lay.addWidget(self.plotter.interactor)
+                self.log("Viewport online — right-click element to see info")
+            except Exception as e:
+                self.plotter = None
+                lay.addWidget(QLabel("Viewport failed"))
+                self.log(f"Viewport error: {e}")
+        else:
+            self.plotter = None
+            lb = QLabel("PyVista not installed\npip install pyvista pyvistaqt")
+            lb.setAlignment(Qt.AlignCenter); lay.addWidget(lb)
+
+        self._build_bottom_bar(lay)
+        return self._right_panel
+
+    def _build_bottom_bar(self, lay):
+        bar = QWidget(); bar.setObjectName("BottomBar"); bar.setFixedHeight(50)
+        self.bottom_bar = bar
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(10, 5, 10, 5)
+        bl.setSpacing(6)
+
+        def sep():
+            f = QFrame(); f.setObjectName("BarSep")
+            f.setFrameShape(QFrame.VLine); f.setFixedWidth(1)
+            return f
+
+        # NEW
+        bl.addWidget(QLabel("Col:"))
+        self.cat_combo = QComboBox()
+        self.cat_combo.addItems(["Default View", "General", "Joint", "Custom"])
+        self.cat_combo.setFixedWidth(100)
+        self.cat_combo.currentIndexChanged.connect(self._on_cat_changed)
+        bl.addWidget(self.cat_combo)
+
+        self.bar_col_combo = QComboBox()
+        self.bar_col_combo.setFixedWidth(150)
+        self.bar_col_combo.setEnabled(False)  # ← add this
+        bl.addWidget(self.bar_col_combo)
+
+        render_btn = QPushButton("Render"); render_btn.setObjectName("RenderBtn")
+        render_btn.setFixedWidth(62)
+        render_btn.clicked.connect(self._render_from_excel)
+        bl.addWidget(render_btn)
+
+        bl.addWidget(sep())
+
+        self.label_btn = QPushButton("📍"); self.label_btn.setObjectName("LabelBtn")
+        self.label_btn.setCheckable(True)
+        self.label_btn.setFixedWidth(36)        # ← square button
+        self.label_btn.setToolTip("PID Labels") # ← tooltip so user knows what it does
+        self.label_btn.clicked.connect(self._toggle_labels)
+        bl.addWidget(self.label_btn)
+
+        self.edges_btn = QPushButton("🧱"); self.edges_btn.setObjectName("LabelBtn")
+        self.edges_btn.setCheckable(True)
+        self.edges_btn.setChecked(True)
+        self.edges_btn.setFixedWidth(36)
+        self.edges_btn.setToolTip("Toggle Edges")
+        self.edges_btn.clicked.connect(self._toggle_edges)
+        bl.addWidget(self.edges_btn)
+
+        self.show_all_btn = QPushButton("👁")
+        self.show_all_btn.setObjectName("LabelBtn")
+        self.show_all_btn.setFixedWidth(36)
+        self.show_all_btn.setToolTip("Show All (unhide PIDs)")
+        self.show_all_btn.clicked.connect(lambda: (self._hidden_pids.clear(), self._re_render()))
+        bl.addWidget(self.show_all_btn)
+
+        self.view_top_btn = QPushButton("XY")
+        self.view_top_btn.setObjectName("LabelBtn")
+        self.view_top_btn.setFixedWidth(36)
+        self.view_top_btn.setToolTip("Top View")
+        self.view_top_btn.clicked.connect(
+            lambda: (self.plotter.view_xy(), self.plotter.render()))
+        bl.addWidget(self.view_top_btn)
+
+        self.view_front_btn = QPushButton("ZY")
+        self.view_front_btn.setObjectName("LabelBtn")
+        self.view_front_btn.setFixedWidth(36)
+        self.view_front_btn.setToolTip("Front View")
+        self.view_front_btn.clicked.connect(
+            lambda: (self.plotter.view_yz(), self.plotter.render()))
+        bl.addWidget(self.view_front_btn)
+
+        self.view_side_btn = QPushButton("ZX")
+        self.view_side_btn.setObjectName("LabelBtn")
+        self.view_side_btn.setFixedWidth(36)
+        self.view_side_btn.setToolTip("Side View")
+        self.view_side_btn.clicked.connect(
+            lambda: (self.plotter.view_xz(), self.plotter.render()))
+        bl.addWidget(self.view_side_btn)
+
+        self.view_iso_btn = QPushButton("R")
+        self.view_iso_btn.setObjectName("LabelBtn")
+        self.view_iso_btn.setFixedWidth(36)
+        self.view_iso_btn.setToolTip("Isometric View")
+        self.view_iso_btn.clicked.connect(
+            lambda: (self.plotter.view_isometric(), self.plotter.render()) if self.plotter else None)
+        bl.addWidget(self.view_iso_btn)
+
+        bl.addWidget(sep())
+
+        bl.addWidget(QLabel("Opacity:"))
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setMinimum(10); self.opacity_slider.setMaximum(100)
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.setMinimumWidth(60)
+        self.opacity_slider.setMaximumWidth(100)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        bl.addWidget(self.opacity_slider)
+        self.opacity_val_lbl = QLabel("100%"); self.opacity_val_lbl.setObjectName("OpacityVal")
+        self.opacity_val_lbl.setFixedWidth(36)
+        bl.addWidget(self.opacity_val_lbl)
+
+        bl.addWidget(QLabel("Bar Thickness:"))
+        self.linewidth_slider = QSlider(Qt.Horizontal)
+        self.linewidth_slider.setMinimum(1)
+        self.linewidth_slider.setMaximum(20)
+        self.linewidth_slider.setValue(8)
+        self.linewidth_slider.setMinimumWidth(60)
+        self.linewidth_slider.setMaximumWidth(100)
+        self.linewidth_slider.valueChanged.connect(self._on_linewidth_changed)
+        bl.addWidget(self.linewidth_slider)
+        self.linewidth_val_lbl = QLabel("8px")
+        self.linewidth_val_lbl.setObjectName("OpacityVal")
+        self.linewidth_val_lbl.setFixedWidth(28)
+        bl.addWidget(self.linewidth_val_lbl)
+
+        bl.addWidget(sep())
+
+        self.pick_status = QLabel("Right-click an element")
+        self.pick_status.setObjectName("PickStatus")
+        self.pick_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.pick_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.pick_status.setMinimumWidth(0)    # allow it to shrink to nothing
+        bl.addWidget(self.pick_status, stretch=1)
+
+        lay.addWidget(bar)
+
+    # =========================================================================
+    # DYNAMIC COLUMN COMBO
+    # =========================================================================
+    def _on_cat_changed(self):
+        cat = self.cat_combo.currentText()
+        self.bar_col_combo.clear()
+        if cat == "Default View":
+            self.bar_col_combo.setEnabled(False)
+        elif cat == "General":
+            self.bar_col_combo.setEnabled(True)
+            self.bar_col_combo.addItems(sorted(BUILTIN_GENERAL_COLS))
+        elif cat == "Joint":
+            self.bar_col_combo.setEnabled(True)
+            self.bar_col_combo.addItems(sorted(BUILTIN_JOINT_COLS))
+        elif cat == "Custom":
+            self.bar_col_combo.setEnabled(True)
+            extra = [c for c in self.df_general.columns if c not in BUILTIN_GENERAL_COLS] if self.df_general is not None else []
+            self.bar_col_combo.addItems(extra)
+
+    def _rebuild_col_combo(self):
+        """
+        Build the column combo from the currently loaded dataframes.
+        Built-in columns always appear first; any extra columns found in
+        the Excel sheets are appended under their own section header.
+        Preserves the previously selected item if it still exists.
+        """
+        HIDDEN_GENERAL_COLS = {
+            "MAT ID"
+        }
+
+
+        prev = self.bar_col_combo.currentText() if hasattr(self, 'bar_col_combo') else "Default View"
+
+        self.bar_col_combo.blockSignals(True)
+        self.bar_col_combo.clear()
+
+        items = ["Default View", "── GENERAL ──"]
+        items += sorted(BUILTIN_GENERAL_COLS - {"Property ID"})
+        items.insert(2, "Property ID")   # keep PID first under GENERAL
+
+        # Dynamic extra GENERAL cols
+        extra_gen = []
+        if self.df_general is not None:
+            skip = BUILTIN_GENERAL_COLS | HIDDEN_GENERAL_COLS
+            for c in self.df_general.columns:
+                if c not in skip:
+                    extra_gen.append(c)
+        if extra_gen:
+            items.append("── GENERAL (custom) ──")
+            items.extend(extra_gen)
+
+        items.append("── JOINT (per element) ──")
+        items += sorted(BUILTIN_JOINT_COLS)
+
+        # Dynamic extra JOINT cols
+        extra_joi = []
+        if self.df_join is not None:
+            skip = {"Property ID", "Property ID (PBARL)", "Element ID (PBARL)",
+                    "MAT ID", "MAT", "Type", "T", "W", "..."}
+            for c in self.df_join.columns:
+                if c not in BUILTIN_JOINT_COLS and c not in skip:
+                    extra_joi.append(c)
+        if extra_joi:
+            items.append("── JOINT (custom) ──")
+            items.extend(extra_joi)
+
+        self.bar_col_combo.addItems(items)
+
+        # Restore previous selection
+        idx = self.bar_col_combo.findText(prev)
+        if idx >= 0:
+            self.bar_col_combo.setCurrentIndex(idx)
+        else:
+            self.bar_col_combo.setCurrentIndex(0)
+
+        self.bar_col_combo.blockSignals(False)
+
+    def _col_sheet(self, col: str) -> tuple[str, str]:
+        """
+        Return (actual_column_name, sheet) for a given combo label.
+        Falls back to searching both dataframes for dynamic columns.
+        """
+        if col in BUILTIN_GENERAL_COLS:
+            return (col, "GENERAL")
+        if col in BUILTIN_JOINT_COLS:
+            return (col, "JOINT")
+
+        ## old 30-line builtin_map dict — delete entirely
+
+        ## Dynamic fallback unchanged
+        if self.df_general is not None and col in self.df_general.columns:
+            return (col, "GENERAL")
+        if self.df_join is not None and col in self.df_join.columns:
+            return (col, "JOINT")
+
+        return (col, "UNKNOWN")
+
+    # =========================================================================
+    # LOG / STATUS
+    # =========================================================================
+    def log(self, msg):
+        self.log_text.append(f"> {msg}")
+        QApplication.processEvents()
+
+    def _set_status(self, msg, kind="ok"):
+        return
+        t = self._theme
+        color = {"ok": t["status_ok"], "warn": t["status_warn"],
+                 "err": t["status_err"]}.get(kind, t["status_ok"])
+        self.status_lbl.setText(f"Status: {msg}")
+        self.status_lbl.setStyleSheet(
+            f"color:{color};font-weight:bold;font-size:11px;"
+            f"padding:2px 4px;background:transparent;")
+        QApplication.processEvents()
+
+    # =========================================================================
+    # ABOUT / HELP
+    # =========================================================================
+    def _show_about(self):
+        QMessageBox.about(self, "About MISGEN",
+            "<b>MISGEN v5.1</b><br>Structural Visualization Suite<br><br>"
+            "Interactive viewer for BDF/FEM models.<br>"
+            "Generates MISC Excel data for structural analysis.")
+
+    def _show_help(self):
+        QMessageBox.information(self, "Help",
+            "<b>Workflow:</b><br>"
+            "1. Load a BDF file (File menu or Browse)<br>"
+            "2. Export the generated MISC Excel<br>"
+            "3. Edit the Excel (add columns freely — they appear automatically)<br>"
+            "4. Select a column in the bottom bar and click <b>Render</b><br>"
+            "   Render reloads the Excel and redraws with latest data.<br><br>"
+            "<b>Tips:</b><br>"
+            "• Right-click elements to inspect<br>"
+            "• Use Property Filter to isolate PIDs<br>"
+            "• 🔄 Refresh View re-renders without reloading Excel<br>"
+            "• Change themes via Themes menu")
+
+    # =========================================================================
+    # FILE BROWSING
+    # =========================================================================
+    def _browse_bdf(self):
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Select BDF File", "", "BDF files (*.bdf);;All files (*.*)")
+        if not fn:
+            return
+        self.bdf_path_str = fn
+        self.bdf_label.setText(os.path.basename(fn))
+        self.log(f"Loading: {os.path.basename(fn)}")
+        self._set_status("Processing…", "warn")
+        try:
+            self.bdf = self._read_bdf(fn)
+            if not self.bdf:
+                raise Exception("BDF read returned None")
+
+            # Invalidate pts cache on new BDF
+            self._pts_cache  = None
+            self._nmap_cache = None
+
+            self.log("BDF loaded OK")
+            self._generate_misc_full()
+            self._pid_color_map.clear()
+            self._rebuild_col_combo()
+            self._viz_default()
+            self.plotter.reset_camera() 
+            self.export_btn.setEnabled(True)
+            self.xl_btn.setEnabled(True)
+            self._set_status(
+                f"BDF loaded — {len(self.df_general)} props · {len(self.df_join)} joints", "ok")
+            self._rebuild_type_radios()
+            #self.info_label.setText(f"{len(self.df_general)} properties  ·  {len(self.df_join)} joints")
+            self._update_workflow_state()
+        except Exception as e:
+            import traceback
+            self.log(f"ERROR: {e}"); self.log(traceback.format_exc())
+            self._set_status("Load failed", "err")
+
+    def _browse_excel(self):
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Select Excel File", "",
+            "Excel files (*.xlsx *.xls);;All files (*.*)")
+        if fn:
+            self.excel_path_str = fn
+            self.xl_label.setText(os.path.basename(fn))
+            self.log(f"Excel: {os.path.basename(fn)}")
+            self._load_excel_data(fn)
+
+    # =========================================================================
+    # EXCEL LOADER
+    # =========================================================================
+    def _load_excel_data(self, fn) -> bool:
+        try:
+            with open(fn, "rb") as f:
+                raw = f.read()
+            xl = pd.ExcelFile(io.BytesIO(raw))
+
+            if "GENERAL" not in xl.sheet_names:
+                raise ValueError("Excel file is missing the 'GENERAL' sheet")
+
+            self.df_general = xl.parse("GENERAL")
+            self.df_join    = xl.parse("JOINT") if "JOINT" in xl.sheet_names else pd.DataFrame()
+            if "JOINT" not in xl.sheet_names:
+                self.log("Warning: 'JOINT' sheet not found")
+
+            try:
+                self.df_stats = xl.parse("STATS")
+            except Exception:
+                self.df_stats = pd.DataFrame({"BDF STATS": ["N/A"]})
+
+            # Cast known ID columns to Int64
+            for df, cols in [
+                (self.df_general, ["Property ID"]),
+                (self.df_join,    ["Property ID", "Property ID (PBARL)"]),
+            ]:
+                for c in cols:
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors='coerce').astype('Int64')
+
+            # Element ID stays float64 — int() at point of use with isna guard
+            if "Element ID (PBARL)" in self.df_join.columns:
+                self.df_join["Element ID (PBARL)"] = pd.to_numeric(
+                    self.df_join["Element ID (PBARL)"], errors='coerce')
+
+            for c in ["T", "W", "Core T", "n1", "n2", "n3", "n4",
+                      "CAI fwidth", "Percent Fixity (Ritz)",
+                      "Ftu (A-basis)", "Fty (A-basis)", "Ftu (B-basis)", "Fty (B-basis)"]:
+                if c in self.df_general.columns:
+                    self.df_general[c] = pd.to_numeric(self.df_general[c], errors='coerce')
+
+            for c in ["Diameter", "Pitch", "Shim"]:
+                if c in self.df_join.columns:
+                    self.df_join[c] = pd.to_numeric(self.df_join[c], errors='coerce')
+
+            n_gen = len(self.df_general)
+            n_joi = len(self.df_join) if not self.df_join.empty else 0
+            self.log(f"Excel loaded — {n_gen} GENERAL rows, {n_joi} JOINT rows")
+
+            # Rebuild combo to pick up any new columns
+            self._rebuild_col_combo()
+            self._update_workflow_state()
+            #self.info_label.setText(f"{n_gen} properties  ·  {n_joi} joint rows")
+            return True
+
+        except Exception as e:
+            import traceback
+            self.log(f"Excel load error: {e}")
+            self.log(traceback.format_exc())
+            self._set_status("Excel load failed", "err")
+            return False
+
+    # =========================================================================
+    # RENDER BUTTON — loads Excel fresh, then renders selected column
+    # =========================================================================
+    def _render_from_excel(self):
+        col = "Default View" if self.cat_combo.currentText() == "Default View" else self.bar_col_combo.currentText()
+        if _is_sep(col):
+            self._viz_default()
+            return
+
+        # If we have an Excel path, reload it to pick up any changes
+        if self.excel_path_str:
+            self.log("Render: reloading Excel…")
+            self._set_status("Loading Excel…", "warn")
+            ok = self._load_excel_data(self.excel_path_str)
+            if not ok:
+                return
+            # After reload, re-read combo (may have changed from rebuild)
+            col = self.bar_col_combo.currentText()
+
+        if self.df_general is None:
+            self.log("No data — load or export Excel first")
+            return
+
+        if _is_sep(col):
+            self._viz_default()
+        else:
+            self._current_col = col
+            self._set_status(f"Rendering '{col}'…", "warn")
+            self._display_col()
+            self._set_status(f"Rendered '{col}'", "ok")
+
+    # =========================================================================
+    # REFRESH VIEW — re-renders current state without reloading Excel
+    # =========================================================================
+    def _re_render(self):
+        if not self.bdf:
+            return
+        col = self._current_col
+        if _is_sep(col):
+            self._viz_default()
+        elif self.df_general is not None:
+            self._display_col()
+        else:
+            self._viz_default()
+
+    def _update_workflow_state(self):
+        has_bdf = self.bdf is not None
+        self.export_btn.setEnabled(has_bdf)
+        self.xl_btn.setEnabled(has_bdf)
+        self.refresh_btn.setEnabled(has_bdf)
+
+    # =========================================================================
+    # BDF READER
+    # =========================================================================
+    def _read_bdf(self, fn):
+        for kw in [
+            dict(xref=False, punch=False, debug=False),
+            dict(xref=False, punch=False, debug=False, encoding='latin1'),
+            dict(xref=False, punch=True,  debug=False),
+            dict(xref=False, punch=True,  debug=False, encoding='latin1'),
+        ]:
+            try:
+                return read_bdf(fn, **kw)
+            except Exception:
+                pass
+        return None
+
+    # =========================================================================
+    # MISC DATA GENERATION
+    # =========================================================================
+    def _generate_misc_full(self):
+        self.log("Generating MISC data…")
+        storage = self._init_storage()
+        pbarl_ll = []; pshell_ll = []
+        for pid in self.bdf.properties:
+            t = self.bdf.properties[pid].type
+            if   t == "PSHELL": self._proc_pshell(pid, pshell_ll, storage)
+            elif t == "PCOMP":  self._proc_pcomp(pid, pshell_ll, storage)
+            elif t == "PBARL":  self._proc_pbarl(pid, pbarl_ll, pshell_ll, storage)
+        self.df_general = pd.DataFrame(storage)
+        pid2eid = self.bdf.get_property_id_to_element_ids_map()
+        self.df_join    = self._build_joint_df(pbarl_ll, pshell_ll, pid2eid)
+        self.df_general = self._update_bc(self.df_general, self.df_join)
+        stats = self.bdf.get_bdf_stats()
+        self.df_stats   = pd.DataFrame({'BDF STATS': [stats[30:]]})
+        self.log(f"MISC OK — {len(self.df_general)} properties  |  {len(self.df_join)} joints")
+
+    def _init_storage(self):
+        return {
+            "Type": [], "Property ID": [], "MAT ID": [], "MAT": [], "T": [],
+            "Core MAT": [], "Core T": [], "W": [],
+            "n1": [], "n2": [], "n3": [], "n4": [],
+            "aoff (deg)": [], "X-Length (mm)": [], "Y-Length (mm)": [], "Dhole (mm)": [],
+            "Crippling Section": [],
+            "Ftu (A-basis)": [], "Fty (A-basis)": [],
+            "Ftu (B-basis)": [], "Fty (B-basis)": [], "Fdur": [],
+            "Class": [],
+            "CAI fwidth": [], "Unloaded edges": [], "Loaded edges": [],
+            "X Boundary (Ritz)": [], "Y Boundary (Ritz)": [],
+            "Edge restraint (Ritz)": [], "Percent Fixity (Ritz)": [],
+        }
+
+    # ── _mat_id returns only what callers actually need ──────────────────────
+    def _mat_id(self, mid) -> tuple:
+        """Return (name, layup, cpt)."""
+        mat_db = {
+            MAT_IM7_M91_A:  dict(name="IM7/M91 194 g/m²",  cpt=0.184),
+            MAT_IM7_M91_B:  dict(name="IM7/M91 194 g/m²",  cpt=0.184,
+                                  layup=[0.4, 0.2, 0.2, 0.2]),
+            MAT_AS4C_M21_A: dict(name="AS4C/M21",           cpt=0.184),
+            MAT_TI_6AL_4V:  dict(name="Ti-6Al-4V",          cpt=0.5),
+        }
+        props = mat_db.get(mid, dict(name="IM7/M91 194 g/m²", cpt=0.184))
+        return props['name'], props.get('layup', DEFAULT_LAYUP.copy()), props['cpt']
+
+    def _proc_pshell(self, pid, pshell_ll, storage):
+        mid  = self.bdf.properties[pid].mid1
+        mn, layup, cpt = self._mat_id(mid)
+        t    = self.bdf.properties[pid].t
+        n1, n2, n3, n4 = self._plies(round(t / cpt), layup)
+        cm, ct  = self._core_props(pid)
+        klass   = self._comp_class(pid)
+        self._append(storage, "PSHELL", pid, mid, mn, t, "n/a", n1, n2, n3, n4, cm, ct, klass, "n/a")
+        pshell_ll.append(pid)
+
+    def _proc_pcomp(self, pid, pshell_ll, storage):
+        mid  = self.bdf.properties[pid].mids[0]
+        mn, layup, cpt = self._mat_id(mid)
+        thk  = np.array(self.bdf.properties[pid].thicknesses)
+        t    = float(sum(thk[thk < 0.5])) if len(thk) > 1 else float(sum(thk))
+        n1, n2, n3, n4 = self._plies(round(t / cpt), layup)
+        cm, ct  = self._core_props(pid)
+        klass   = self._comp_class(pid)
+        self._append(storage, "PCOMP", pid, mid, mn, t, "n/a", n1, n2, n3, n4, cm, ct, klass, "n/a")
+        pshell_ll.append(pid)
+
+    def _proc_pbarl(self, pid, pbarl_ll, pshell_ll, storage):
+        mid  = self.bdf.properties[pid].mid
+        mn, layup, cpt = self._mat_id(mid)
+        t    = min(self.bdf.properties[pid].dim)
+        try:    w = max(self.bdf.properties[pid].dim)
+        except: w = "n/a"
+        n1, n2, n3, n4 = self._plies(round(t / cpt), layup)
+        klass = self._comp_class(pid)
+        crip  = "n/a"
+        if isinstance(w, (int, float)):
+            crip = "Single Flange" if w <= DEFAULT_STIFFENER_FLANGE else "Double Flange"
+        self._append(storage, "PBARL", pid, mid, mn, t, w, n1, n2, n3, n4, "n/a", "n/a", klass, crip)
+        pbarl_ll.append(pid)
+        pshell_ll.append(pid)
+
+    def _comp_class(self, pid):
+        s = str(pid)
+        return "B" if (len(s) >= 3 and s[2] in [PID_UPPER_SKIN, PID_LOWER_SKIN]) else "A"
+
+    def _core_props(self, pid):
+        s = str(pid)
+        if len(s) >= 3 and s[2] in [PID_UPPER_SKIN, PID_LOWER_SKIN]:
+            return DEFAULT_CORE_MAT, 0
+        return "n/a", "n/a"
+
+    def _plies(self, ply, layup):
+        if ply <= 0:
+            return 0, 0, 0, 0
+        mod = ply % 4
+        if mod == 0:
+            n1 = math.ceil(ply * layup[0]);  n2 = math.ceil(ply * layup[1])
+            n3 = math.ceil(ply * layup[2]);  n4 = math.floor(ply * layup[3])
+        elif mod == 1:
+            mp = ply - 1
+            n1 = math.ceil(mp * layup[0]) + 1; n2 = math.ceil(mp * layup[1])
+            n3 = math.ceil(mp * layup[2]);      n4 = math.floor(mp * layup[3])
+        elif mod == 2:
+            n1 = math.ceil(ply * layup[0]);  n2 = math.ceil(ply * layup[1]) + 1
+            n3 = math.ceil(ply * layup[2]) + 1; n4 = math.floor(ply * layup[3])
+        else:
+            mp = ply - 3
+            n1 = math.ceil(mp * layup[0]) + 1;  n2 = math.floor(mp * layup[1]) + 1
+            n3 = math.floor(mp * layup[2]) + 1; n4 = math.ceil(mp * layup[3])
+        d = {1: n1, 2: n2, 3: n3, 4: n4}
+        cs  = sum(d.values()); idx = 1
+        while cs < ply: d[idx] += 1; cs += 1; idx = (idx % 4) + 1
+        idx = 1
+        while cs > ply:
+            k = 4 - idx + 1
+            if d[k] > 0: d[k] -= 1; cs -= 1
+            idx = (idx % 4) + 1
+        return d[1], d[2], d[3], d[4]
+
+    def _append(self, s, ptype, pid, mid, mname, t, w, n1, n2, n3, n4,
+                core_mat, core_t, klass, crip):
+        na = "n/a"
+        s["Type"].append(ptype);           s["Property ID"].append(pid)
+        s["MAT ID"].append(mid);           s["MAT"].append(mname)
+        s["T"].append(t);                  s["Core MAT"].append(core_mat)
+        s["Core T"].append(core_t);        s["W"].append(w)
+        s["n1"].append(n1);                s["n2"].append(n2)
+        s["n3"].append(n3);                s["n4"].append(n4)
+        s["aoff (deg)"].append(0)
+        s["X-Length (mm)"].append(na);     s["Y-Length (mm)"].append(na)
+        s["Dhole (mm)"].append(0);         s["Crippling Section"].append(crip)
+        s["Ftu (A-basis)"].append(na);     s["Fty (A-basis)"].append(na)
+        s["Ftu (B-basis)"].append(na);     s["Fty (B-basis)"].append(na)
+        s["Fdur"].append(na);              s["Class"].append(klass)
+        s["Unloaded edges"].append("Simply Supported")
+        s["Loaded edges"].append("Simply Supported")
+        s["CAI fwidth"].append(DEFAULT_STIFFENER_FLANGE)
+        s["X Boundary (Ritz)"].append("SS"); s["Y Boundary (Ritz)"].append("SS")
+        s["Edge restraint (Ritz)"].append("Percent Fixity")
+        s["Percent Fixity (Ritz)"].append(50)
+
+    def _build_joint_df(self, pbarl_ll, pshell_ll, pid2eid):
+        df_inter = self._bar_shell_intersect(pbarl_ll, pshell_ll)
+        rows = []
+        for _, row in df_inter.iterrows():
+            pbarl  = row["Property ID (PBARL)"]
+            pshell = row["Property ID"]
+            for el in pid2eid.get(pbarl, []):
+                side = "TAIL" if str(pbarl)[2:3] in [PID_SUBSTRU_A, PID_SUBSTRU_B] else "HEAD"
+                rows.append((pshell, pbarl, el, None, None, None, side, 5, 2, "Multiple row", "YES"))
+        df = pd.DataFrame(rows, columns=[
+            "Property ID", "Property ID (PBARL)", "Element ID (PBARL)",
+            "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim", "Application", "Prying"])
+        df = pd.merge(df, self.df_general, on="Property ID", how="inner")
+        df["W"] = df["Property ID (PBARL)"].apply(
+            lambda x: max(self.bdf.properties[x].dim)
+            if isinstance(x, int) and x in self.bdf.properties else x)
+        df["Application"] = df["W"].apply(
+            lambda x: "Single row" if isinstance(x, (int, float)) and x <= 50 else "Multiple row")
+        self._fill_pin_collar(df)
+        df["..."] = ''
+        cols = ["Property ID (PBARL)", "Element ID (PBARL)", "W",
+                "Pin", "Collar", "Diameter", "Side", "Pitch", "Shim",
+                "Application", "Prying", "...", "Property ID", "Type", "MAT ID", "MAT", "T"]
+
+        # Deduplicate so each element ID appears exactly once
+        df = df.drop_duplicates(subset=["Element ID (PBARL)"], keep='first')
+        return df[[c for c in cols if c in df.columns]]
+
+    def _fill_pin_collar(self, df):
+        df["Diameter"] = df["W"].apply(self._pin_dia)
+        for i in df.index:
+            pid = df.at[i, "Property ID"]
+            dia = df.at[i, "Diameter"]
+            d   = str(pid)[2:3] if len(str(pid)) >= 3 else None
+            if d == PID_LOWER_SKIN:
+                pin, collar, shim = (("ELS320", "EN2182ND", 2)
+                                     if dia <= 9.53 else ("HST 646", "STR20K", 2))
+            elif d == PID_UPPER_SKIN:
+                pin, collar, shim = "BG2082", "Not Applicable", 2
+            elif d in [PID_OTHER, PID_SUBSTRU_A, PID_SUBSTRU_B]:
+                pin, collar, shim = "ELS420", "EN2182ND", self._shim(dia)
+            else:
+                pin, collar, shim = "BG2082", "Not Applicable", self._shim(dia)
+            df.at[i, "Pin"]    = pin
+            df.at[i, "Collar"] = collar
+            df.at[i, "Shim"]   = shim
+
+    def _pin_dia(self, w):
+        if not isinstance(w, (int, float)):
+            return 4.17
+        for lim, dia in [(43, 4.17), (52, 4.78), (61, 6.35), (71, 7.92),
+                         (80, 9.53), (87, 11.13), (99, 12.7)]:
+            if w <= lim:
+                return dia
+        return 14.3
+
+    def _shim(self, dia):
+        return {4.17: 1.2, 4.78: 1.2, 6.35: 1.6, 7.92: 2.0}.get(dia, 2)
+
+    def _bar_shell_intersect(self, given_bar, given_shell):
+        """Find shell PIDs that share nodes with bar PIDs (≥2 shared nodes)."""
+        comp_nodes = {}   # pid → set of nodes  (shells)
+        bar_nodes  = {}   # pid → set of nodes  (bars)
+
+        for eid, elem in self.bdf.elements.items():
+            if elem.pid not in self.bdf.properties:
+                continue
+            ptype = self.bdf.properties[elem.pid].type
+            if ptype in ("PSHELL", "PCOMP"):
+                comp_nodes.setdefault(elem.pid, set()).update(elem.node_ids)
+            elif ptype == "PBARL":
+                bar_nodes.setdefault(elem.pid, set()).update(elem.node_ids)
+
+        rows = []
+        for s_pid, s_nodes in comp_nodes.items():
+            for b_pid, b_nodes in bar_nodes.items():
+                if len(s_nodes & b_nodes) >= 2:
+                    rows.append({"Property ID": s_pid, "Property ID (PBARL)": b_pid})
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame(
+            columns=["Property ID", "Property ID (PBARL)"])
+
+    def _update_bc(self, df, df_join):
+        def bar_w(pid):
+            try:
+                ws = df_join[df_join["Property ID"] == pid]["W"]
+                if ws.empty:
+                    return DEFAULT_STIFFENER_FLANGE
+                valid = [w for w in ws if isinstance(w, (int, float)) and w > 2]
+                return max(valid) if valid else max(ws)
+            except Exception:
+                return DEFAULT_STIFFENER_FLANGE
+        df["CAI fwidth"]     = df["Property ID"].apply(bar_w)
+        df["Unloaded edges"] = df["CAI fwidth"].apply(
+            lambda x: "50% Fixity" if x > 40 else "Simply Supported")
+        df["Y Boundary (Ritz)"] = df["CAI fwidth"].apply(
+            lambda x: "CC" if x > 40 else "SS")
+        return df
+
+    # =========================================================================
+    # EXCEL EXPORT
+    # =========================================================================
+    def _export_excel(self):
+        if self.df_general is None:
+            self.log("No data — load BDF first"); return
+        default = (f"{os.path.splitext(os.path.basename(self.bdf_path_str))[0]}_misc.xlsx"
+                   if self.bdf_path_str else "misc.xlsx")
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Save MISC Excel", default, "Excel files (*.xlsx)")
+        if not fn:
+            return
+        try:
+            writer = pd.ExcelWriter(fn, engine='xlsxwriter')
+            self.df_general.to_excel(writer, sheet_name="GENERAL", index=False)
+            self.df_join.to_excel(writer,    sheet_name="JOINT",   index=False)
+            self.df_stats.to_excel(writer,   sheet_name="STATS",   index=False)
+            ws  = writer.sheets["STATS"]
+            fmt = writer.book.add_format({'text_wrap': True})
+            ws.set_column("A:A", 50, fmt)
+            writer.close()
+            self.log(f"Exported: {fn}")
+            self.excel_path_str = fn
+            self.xl_label.setText(os.path.basename(fn))
+            self.xl_btn.setEnabled(True)
+            self._update_workflow_state()
+            self._set_status("MISC exported — edit then click Render to reload", "ok")
+        except Exception as e:
+            self.log(f"Export error: {e}"); self._set_status("Export failed", "err")
+
+    # =========================================================================
+    # FILTER
+    # =========================================================================
+    def _add_type_radio(self, label):
+        rb = QRadioButton(label)
+        rb.toggled.connect(lambda on, l=label: self._on_type_radio(l, on))
+        self.type_radios[label] = rb
+        self.type_radio_layout.insertWidget(self.type_radio_layout.count() - 1, rb)
+
+    def _rebuild_type_radios(self):
+        if self.df_general is None or "Type" not in self.df_general.columns:
+            return
+        found = set(self.df_general["Type"].dropna().unique())
+        for lbl, rb in self.type_radios.items():
+            rb.blockSignals(True)
+            if lbl == "All":
+                rb.setEnabled(True); rb.setChecked(True)
+            elif lbl in found:
+                rb.setEnabled(True)
+            else:
+                rb.setEnabled(False)
+            rb.blockSignals(False)
+        for t in sorted(found - {"All", "PSHELL", "PCOMP", "PBARL"}):
+            if t not in self.type_radios:
+                self._add_type_radio(t)
+
+    def _on_type_radio(self, label, checked):
+        if not checked:
+            return
+        self._selected_type = label if label != "All" else None
+        self._re_render()
+
+    def _selected_eids(self):
+        if not self.bdf:
+            return []
+        txt      = self.prop_input.text().strip()
+        all_pids = set(self.bdf.properties.keys())
+        if txt.lower() == "all":
+            sel = all_pids
+        else:
+            sel = set()
+            for tok in re.split(r'[\s,]+', txt):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                m = re.match(r'^(\d+)-(\d+)$', tok)
+                if m:
+                    for p in range(int(m.group(1)), int(m.group(2)) + 1):
+                        if p in all_pids: sel.add(p)
+                else:
+                    try:
+                        p = int(tok)
+                        if p in all_pids: sel.add(p)
+                    except ValueError:
+                        pass
+        valid_types = {"CQUAD4", "CTRIA3", "CBAR", "CBEAM", "CBUSH",
+                       "CQUAD8", "CQUAD", "CTRIA6"}
+        result = []
+        for eid, elem in self.bdf.elements.items():
+            if elem.type not in valid_types:
+                continue
+            pid = getattr(elem, 'pid', None)
+            if pid not in sel:
+                continue
+            if pid in self._hidden_pids:   # ← add this
+                continue
+            if pid not in self.bdf.properties:
+                continue
+            if self._selected_type and self.bdf.properties[pid].type != self._selected_type:
+                continue
+            result.append(eid)
+        return result
+
+    # =========================================================================
+    # OPACITY
+    # =========================================================================
+    def _on_opacity_changed(self, val):
+        self.opacity_val_lbl.setText(f"{val}%")
+        op = val / 100.0
+        for actor in self._viz_actors:
+            try: actor.GetProperty().SetOpacity(op)
+            except Exception: pass
+        if self.plotter:
+            self.plotter.render()
+
+    def _on_linewidth_changed(self, val):
+        self.linewidth_val_lbl.setText(f"{val}px")
+        for actor in self._viz_actors:
+            try:
+                if actor.GetProperty().GetRenderLinesAsTubes():
+                    actor.GetProperty().SetLineWidth(val)
+            except Exception:
+                pass
+        if self.plotter:
+            self.plotter.render()
+
+    # =========================================================================
+    # VIZ — Default
+    # =========================================================================
+    def _viz_default(self):
+        if not self.plotter or not self.bdf:
+            return
+        eids = self._selected_eids()
+        if not eids:
+            self.log("No elements for filter"); return
+        pts, nmap = self._build_pts()
+        self.plotter.clear(); self._viz_actors = []
+        self.plotter.set_background(self._theme["vp_bg_hex"])
+
+        sh_cells = []; sh_pids = []; sh_eids = []
+        bar_pts2 = []; bar_lines = []; bar_pids = []; bar_eids = []
+
+        for eid in eids:
+            elem = self.bdf.elements[eid]; pid = elem.pid
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([4] + [nmap[n] for n in nids])
+                        sh_pids.append(pid); sh_eids.append(eid)
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([3] + [nmap[n] for n in nids])
+                        sh_pids.append(pid); sh_eids.append(eid)
+                elif elem.type == 'CBAR':
+                    nids = elem.node_ids[:2]
+                    if all(n in nmap for n in nids):
+                        p1 = self.bdf.nodes[nids[0]].get_position()
+                        p2 = self.bdf.nodes[nids[1]].get_position()
+                        i  = len(bar_pts2)
+                        bar_pts2.extend([p1, p2]); bar_lines.append([2, i, i + 1])
+                        bar_pids.append(pid); bar_eids.append(eid)
+            except Exception:
+                continue
+
+        op = self.opacity_slider.value() / 100.0
+        if sh_cells:
+            mesh  = pv.PolyData(pts, np.hstack(sh_cells))
+            actor = self.plotter.add_mesh(
+                mesh, color=self._theme["shell"], show_edges=True,
+                edge_color="#aabbcc", opacity=op, pickable=True, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+        if bar_lines:
+            bm    = pv.PolyData(np.array(bar_pts2), lines=np.hstack(bar_lines))
+            actor = self.plotter.add_mesh(
+                bm, color=self._theme["bar"], line_width=self.linewidth_slider.value(),
+                render_lines_as_tubes=True, opacity=op, pickable=True, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+
+        self._store_mesh(pts, sh_cells, sh_pids, sh_eids,
+                         bar_pts2, bar_lines, bar_pids, bar_eids)
+        self.current_column_data = None
+        self._current_col = "Default View"
+
+        cam = self.plotter.camera_position
+        self.plotter.add_axes(color=self._theme["axes_color"], viewport=(0.0, 0.0, 0.12, 0.15))
+        self.plotter.render()
+        self.plotter.camera_position = cam
+
+        self._toggle_edges(); self.label_btn.isChecked() and self._toggle_labels()
+        self.log(f"Default view — {len(eids)} elements")
+
+    # =========================================================================
+    # VIZ — Property IDs
+    # =========================================================================
+    def _viz_property_ids(self):
+        if not self.plotter or not self.bdf:
+            return
+        eids = self._selected_eids()
+        if not eids:
+            return
+        pts, nmap = self._build_pts()
+        self.plotter.clear(); self._viz_actors = []
+        self.plotter.set_background(self._theme["vp_bg_hex"])
+
+        pid_sh_cells = {}; pid_bar_data = {}
+        sh_cells_flat = []; sh_pids_flat = []; sh_eids_flat = []
+        bar_pts_all = []; bar_lines_all = []; bar_pids_flat = []; bar_eids_flat = []
+
+        for eid in eids:
+            elem = self.bdf.elements[eid]; pid = elem.pid
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        c = [4] + [nmap[n] for n in nids]
+                        pid_sh_cells.setdefault(pid, []).append(c)
+                        sh_cells_flat.append(c); sh_pids_flat.append(pid); sh_eids_flat.append(eid)
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        c = [3] + [nmap[n] for n in nids]
+                        pid_sh_cells.setdefault(pid, []).append(c)
+                        sh_cells_flat.append(c); sh_pids_flat.append(pid); sh_eids_flat.append(eid)
+                elif elem.type == 'CBAR':
+                    nids = elem.node_ids[:2]
+                    if all(n in nmap for n in nids):
+                        p1 = self.bdf.nodes[nids[0]].get_position()
+                        p2 = self.bdf.nodes[nids[1]].get_position()
+                        pid_bar_data.setdefault(pid, []).append((p1, p2, eid))
+            except Exception:
+                continue
+
+        op = self.opacity_slider.value() / 100.0
+        for pid, cells in pid_sh_cells.items():
+            mesh  = pv.PolyData(pts, np.hstack(cells))
+            actor = self.plotter.add_mesh(
+                mesh, color=self._pid_color(pid), show_edges=True,
+                edge_color="#aabbcc", opacity=op, pickable=True, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+        for pid, bar_list in pid_bar_data.items():
+            bp = []; bl = []
+            for p1, p2, eid in bar_list:
+                i  = len(bp);  bp.extend([p1, p2]); bl.append([2, i, i + 1])
+                gi = len(bar_pts_all); bar_pts_all.extend([p1, p2])
+                bar_lines_all.append([2, gi, gi + 1])
+                bar_pids_flat.append(pid)
+                bar_eids_flat.append(eid)  ## was missing — caused length mismatch in _store_mesh
+            bm    = pv.PolyData(np.array(bp), lines=np.hstack(bl))
+            actor = self.plotter.add_mesh(
+                bm, color=self._pid_color(pid), line_width=self.linewidth_slider.value(),
+                render_lines_as_tubes=True, opacity=op, pickable=True, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+
+        self._store_mesh(pts, sh_cells_flat, sh_pids_flat, sh_eids_flat,
+                         bar_pts_all, bar_lines_all, bar_pids_flat, bar_eids_flat)
+        self._current_col = "Property ID"
+
+        cam = self.plotter.camera_position
+        self.plotter.add_axes(color=self._theme["axes_color"], viewport=(0.0, 0.0, 0.12, 0.15))
+        self.plotter.render()
+        self.plotter.camera_position = cam
+
+        self._toggle_edges(); self.label_btn.isChecked() and self._toggle_labels()
+        self.log(f"Property ID view — {len(set(sh_pids_flat + bar_pids_flat))} PIDs")
+
+    # =========================================================================
+    # VIZ — Column  (dynamic: resolves sheet via _col_sheet)
+    # =========================================================================
+    def _display_col(self):
+        col = self._current_col
+        if not col:
+            col = self.bar_col_combo.currentText()
+        if _is_sep(col):
+            self._viz_default(); return
+        if col == "Property ID":
+            self._viz_property_ids(); return
+        if self.df_general is None:
+            self.log("No data — load Excel first"); return
+
+        cname, sheet = self._col_sheet(col)
+        if sheet == "UNKNOWN":
+            self.log(f"Column '{col}' not found in any sheet"); return
+
+        df_src = self.df_join if sheet == "JOINT" else self.df_general
+        if df_src is None or df_src.empty:
+            self.log(f"No data in {sheet} sheet"); return
+        if cname not in df_src.columns:
+            self.log(f"'{cname}' not in {sheet} — available: {list(df_src.columns)}"); return
+
+        filtered_eids = set(self._selected_eids())
+        filtered_pids = {
+            self.bdf.elements[e].pid for e in filtered_eids
+            if e in self.bdf.elements and hasattr(self.bdf.elements[e], 'pid')
+        }
+
+        def _clean(v):
+            if v is None:
+                return None
+            try:
+                if pd.isna(v): return None
+            except (TypeError, ValueError):
+                pass
+            s = str(v).strip().lower()
+            return None if s in ("n/a", "na", "nan", "none", "") else v
+
+        if sheet == "JOINT":
+            eid_col = "Element ID (PBARL)"
+            if eid_col not in df_src.columns:
+                self.log(f"'{eid_col}' not in JOINT sheet"); return
+            eid_to_val = {}
+            for _, row in df_src.iterrows():
+                try:
+                    raw = row[eid_col]
+                    if pd.isna(raw): continue
+                    eid_to_val[int(raw)] = _clean(row[cname])
+                except (TypeError, ValueError):
+                    continue
+            samples  = [v for v in eid_to_val.values() if v is not None]
+            use_eid  = True
+        else:
+            pid_to_val = {}
+            for _, row in df_src.iterrows():
+                try:
+                    pid_int = int(row["Property ID"])
+                except (TypeError, ValueError):
+                    continue
+                if pid_int not in filtered_pids:
+                    continue
+                pid_to_val[pid_int] = _clean(row[cname])
+            samples  = [v for v in pid_to_val.values() if v is not None]
+            use_eid  = False
+
+        if not samples:
+            self.log(f"No valid values for '{cname}' in {sheet}")
+            self._viz_default(); return
+
+        #is_num = all(isinstance(v, (int, float)) for v in samples)
+        unique_count = len(set(samples))
+        is_num = all(isinstance(v, (int, float)) for v in samples) and unique_count > 8
+
+        pts, nmap = self._build_pts()
+        self.plotter.clear(); self._viz_actors = []
+        self.plotter.set_background(self._theme["vp_bg_hex"])
+        self.log(f"Rendering {sheet}/{cname} ({'numeric' if is_num else 'discrete'}) …")
+
+        if use_eid:
+            if is_num: self._viz_continuous_eid(pts, nmap, eid_to_val, cname, filtered_eids)
+            else:       self._viz_discrete_eid(pts, nmap, eid_to_val, cname, filtered_eids)
+        else:
+            if is_num: self._viz_continuous(pts, nmap, pid_to_val, cname)
+            else:       self._viz_discrete(pts, nmap, pid_to_val, cname, filtered_eids)
+
+        cam = self.plotter.camera_position
+        self.plotter.add_axes(color=self._theme["axes_color"], viewport=(0.0, 0.0, 0.12, 0.15))
+        self.plotter.render()
+        self.plotter.camera_position = cam
+
+        self._toggle_edges(); self.label_btn.isChecked() and self._toggle_labels()
+        self.log(f"Done: {cname}")
+
+    # =========================================================================
+    # BUILD PTS  (cached per BDF load)
+    # =========================================================================
+    def _build_pts(self):
+        if self._pts_cache is None:
+            nodes = []; nmap = {}
+            for nid, node in self.bdf.nodes.items():
+                nmap[nid] = len(nodes)
+                nodes.append(node.get_position())
+            self._pts_cache  = np.array(nodes)
+            self._nmap_cache = nmap
+        return self._pts_cache, self._nmap_cache
+
+    def _store_mesh(self, pts, sh_cells, sh_pids, sh_eids,
+                    bar_pts, bar_lines, bar_pids, bar_eids):
+        """Combine shell + bar geometry into current_mesh and update bookkeeping arrays."""
+        all_pids = sh_pids + bar_pids
+        all_eids = sh_eids + bar_eids
+        if sh_cells and bar_pts:
+            self.current_mesh = pv.PolyData(pts, np.hstack(sh_cells)).merge(
+                pv.PolyData(np.array(bar_pts), lines=np.hstack(bar_lines)))
+        elif sh_cells:
+            self.current_mesh = pv.PolyData(pts, np.hstack(sh_cells))
+        elif bar_pts and bar_lines:
+            self.current_mesh = pv.PolyData(np.array(bar_pts), lines=np.hstack(bar_lines))
+        else:
+            self.current_mesh = None
+        self.current_pid_data = np.array(all_pids) if all_pids else None
+        self.current_eid_data = np.array(all_eids) if all_eids else None
+
+    def _iter_elements(self, allowed_eids, nmap, pid_to_val=None, eid_to_val=None):
+        for eid, elem in self.bdf.elements.items():
+            if eid not in allowed_eids: continue
+            pid = getattr(elem, 'pid', None); val = None
+            if pid_to_val is not None:  val = pid_to_val.get(pid)
+            elif eid_to_val is not None: val = eid_to_val.get(eid)
+            yield eid, elem, pid, val
+
+    def _sbar_args(self, cname, per_eid=False):
+        label = f"{cname}{' (per EID)' if per_eid else ''}\n"
+        return dict(title=label, vertical=True, n_labels=5, fmt='%.2f',
+                    position_x=0.90, position_y=0.10,
+                    width=0.04, height=0.70,
+                    color=self._theme["text"])   # ← change '#333333' to this
+
+    # -------------------------------------------------------------------------
+    def _viz_continuous(self, pts, nmap, pid_to_val, cname):
+        sh_cells = []; sh_vals = []; sh_pids = []; sh_eids = []
+        bar_pts2 = []; bar_lines = []; bar_vals = []; bar_pids = []; bar_eids = []
+        allowed = set(self._selected_eids())
+        op = self.opacity_slider.value() / 100.0
+        cmap = self._theme["cmap"]
+        self._eid_val_map = {}
+
+        for eid, elem, pid, val in self._iter_elements(allowed, nmap, pid_to_val=pid_to_val):
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([4] + [nmap[n] for n in nids])
+                        sh_vals.append(float(val) if val is not None else 0.0)
+                        sh_pids.append(pid); sh_eids.append(eid)
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([3] + [nmap[n] for n in nids])
+                        sh_vals.append(float(val) if val is not None else 0.0)
+                        sh_pids.append(pid); sh_eids.append(eid)
+                elif elem.type == 'CBAR':
+                    nids = elem.node_ids[:2]
+                    if all(n in nmap for n in nids):
+                        p1 = self.bdf.nodes[nids[0]].get_position()
+                        p2 = self.bdf.nodes[nids[1]].get_position()
+                        i  = len(bar_pts2); bar_pts2.extend([p1, p2]); bar_lines.append([2, i, i + 1])
+                        bar_vals.append(float(val) if val is not None else 0.0)
+                        bar_pids.append(pid); bar_eids.append(eid)
+                self._eid_val_map[eid] = val
+            except Exception:
+                continue
+
+        sbar = self._sbar_args(cname)
+        if sh_cells:
+            mesh = pv.PolyData(pts, np.hstack(sh_cells)); mesh.cell_data[cname] = np.array(sh_vals)
+            vv   = [v for v in sh_vals if v > 0]
+            actor = self.plotter.add_mesh(mesh, scalars=cname, cmap=cmap, show_edges=True,
+                                          opacity=op, clim=[min(vv) if vv else 0, max(vv) if vv else 1],
+                                          show_scalar_bar=True, pickable=True, scalar_bar_args=sbar)
+            self._viz_actors.append(actor)
+            self.current_mesh = mesh
+            self.current_pid_data = np.array(sh_pids)
+            self.current_eid_data = np.array(sh_eids)
+            self.current_column_data = np.array(sh_vals)
+        if bar_lines:
+            bm = pv.PolyData(np.array(bar_pts2), lines=np.hstack(bar_lines))
+            bm.cell_data[cname] = np.array(bar_vals)
+            vv = [v for v in bar_vals if v > 0]
+            actor = self.plotter.add_mesh(bm, scalars=cname, cmap=cmap, 
+                                          line_width=self.linewidth_slider.value(),
+                                          render_lines_as_tubes=True, opacity=op,
+                                          clim=[min(vv) if vv else 0, max(vv) if vv else 1],
+                                          show_scalar_bar=not sh_cells, pickable=True,
+                                          scalar_bar_args=sbar)
+            self._viz_actors.append(actor)
+            if not sh_cells:
+                self.current_mesh = bm
+                self.current_pid_data = np.array(bar_pids)
+                self.current_eid_data = np.array(bar_eids)
+                self.current_column_data = np.array(bar_vals)
+
+    def _viz_continuous_eid(self, pts, nmap, eid_to_val, cname, allowed_eids):
+        bar_pts2 = []; bar_lines = []; bar_vals = []; bar_pids = []; bar_eids = []
+        op   = self.opacity_slider.value() / 100.0
+        cmap = self._theme["cmap"]
+        self._eid_val_map = {}
+
+        for eid, elem, pid, val in self._iter_elements(allowed_eids, nmap, eid_to_val=eid_to_val):
+            if val is None or elem.type != 'CBAR': continue
+            try:
+                nids = elem.node_ids[:2]
+                if not all(n in nmap for n in nids): continue
+                p1 = self.bdf.nodes[nids[0]].get_position()
+                p2 = self.bdf.nodes[nids[1]].get_position()
+                i  = len(bar_pts2); bar_pts2.extend([p1, p2]); bar_lines.append([2, i, i + 1])
+                bar_vals.append(float(val)); bar_pids.append(pid); bar_eids.append(eid)
+                self._eid_val_map[eid] = val
+            except Exception:
+                continue
+
+        sh_cells = []
+        for eid, elem, pid, _ in self._iter_elements(allowed_eids, nmap):
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([4] + [nmap[n] for n in nids])
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([3] + [nmap[n] for n in nids])
+            except Exception:
+                continue
+
+        if sh_cells:
+            m = pv.PolyData(pts, np.hstack(sh_cells))
+            actor = self.plotter.add_mesh(m, color='#cccccc', show_edges=True,
+                                        opacity=op * 0.5, pickable=False, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+            
+        if not bar_lines:
+            self.log("No joint bar elements visible"); return
+        sbar = self._sbar_args(cname, per_eid=True)
+        bm   = pv.PolyData(np.array(bar_pts2), lines=np.hstack(bar_lines))
+        bm.cell_data[cname] = np.array(bar_vals)
+        self.current_mesh = bm
+        self.current_pid_data = np.array(bar_pids)
+        self.current_eid_data = np.array(bar_eids)
+        self.current_column_data = np.array(bar_vals)
+        vv = [v for v in bar_vals if v != 0]
+        actor = self.plotter.add_mesh(bm, scalars=cname, cmap=cmap, 
+                                      line_width=self.linewidth_slider.value(),
+                                      render_lines_as_tubes=True, opacity=op,
+                                      clim=[min(vv) if vv else 0, max(vv) if vv else 1],
+                                      show_scalar_bar=True, pickable=True, scalar_bar_args=sbar)
+        self._viz_actors.append(actor)
+
+    def _viz_discrete(self, pts, nmap, pid_to_val, cname, allowed_eids):
+        unique = sorted({v for v in pid_to_val.values() if v is not None}, key=str)
+        v2c    = self._discrete_colors(unique)
+        op     = self.opacity_slider.value() / 100.0
+        lbg    = self._theme["legend_bg"]
+        self._eid_val_map = {}
+
+        # Single pass: bucket cells and bar segments by value
+        sh_by_val  = {v: ([], [], []) for v in unique}   # val → (cells, pids, eids)
+        bar_by_val = {v: ([], [])     for v in unique}   # val → (pts_list, lines_list)
+        na_cells = []; na_pids = []; na_eids = []
+        all_cells = []; all_pids = []; all_eids = []
+
+        for eid, elem, pid, v in self._iter_elements(allowed_eids, nmap, pid_to_val=pid_to_val):
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        c = [4] + [nmap[n] for n in nids]
+                        if v is not None:
+                            sh_by_val[v][0].append(c)
+                            sh_by_val[v][1].append(pid)
+                            sh_by_val[v][2].append(eid)
+                            self._eid_val_map[eid] = v
+                        else:
+                            na_cells.append(c); na_pids.append(pid); na_eids.append(eid)
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        c = [3] + [nmap[n] for n in nids]
+                        if v is not None:
+                            sh_by_val[v][0].append(c)
+                            sh_by_val[v][1].append(pid)
+                            sh_by_val[v][2].append(eid)
+                            self._eid_val_map[eid] = v
+                        else:
+                            na_cells.append(c); na_pids.append(pid); na_eids.append(eid)
+                elif elem.type == 'CBAR':
+                    nids = elem.node_ids[:2]
+                    if all(n in nmap for n in nids) and v is not None:
+                        p1 = self.bdf.nodes[nids[0]].get_position()
+                        p2 = self.bdf.nodes[nids[1]].get_position()
+                        bp, bl_ = bar_by_val[v]
+                        i = len(bp); bp.extend([p1, p2]); bl_.append([2, i, i + 1])
+                        self._eid_val_map[eid] = v
+            except Exception:
+                continue
+
+        for val in unique:
+            cells, pids, eids = sh_by_val[val]
+            if cells:
+                m     = pv.PolyData(pts, np.hstack(cells))
+                actor = self.plotter.add_mesh(m, color=v2c[val], show_edges=True,
+                                              opacity=op, pickable=True, show_scalar_bar=False)
+                self._viz_actors.append(actor)
+                all_cells.extend(cells); all_pids.extend(pids); all_eids.extend(eids)
+            bp, bl_ = bar_by_val[val]
+            if bl_:
+                bm    = pv.PolyData(np.array(bp), lines=np.hstack(bl_))
+                actor = self.plotter.add_mesh(bm, color=v2c[val], 
+                                              line_width=self.linewidth_slider.value(),
+                                              render_lines_as_tubes=True, opacity=op,
+                                              pickable=True, show_scalar_bar=False)
+                self._viz_actors.append(actor)
+
+        if na_cells:
+            m     = pv.PolyData(pts, np.hstack(na_cells))
+            actor = self.plotter.add_mesh(m, color='#cccccc', show_edges=True,
+                                          opacity=op * 0.5, pickable=True)
+            self._viz_actors.append(actor)
+            all_cells.extend(na_cells); all_pids.extend(na_pids); all_eids.extend(na_eids)
+
+        if all_cells:
+            self.current_mesh     = pv.PolyData(pts, np.hstack(all_cells))
+            self.current_pid_data = np.array(all_pids)
+            self.current_eid_data = np.array(all_eids)
+
+        legend_entries = [[str(v), v2c[v]] for v in unique]
+        if na_cells:
+            legend_entries.append(['n/a', '#cccccc'])
+        try:
+            if legend_entries:
+                self.plotter.add_legend(
+                    labels=legend_entries, face='rectangle',
+                    size=(0.18, min(0.06 + len(legend_entries) * 0.035, 0.50)),
+                    loc='upper left', bcolor=None, border=False)
+        except Exception:
+            pass
+    
+    def _viz_discrete_eid(self, pts, nmap, eid_to_val, cname, allowed_eids):
+        unique = sorted({v for v in eid_to_val.values() if v is not None}, key=str)
+        v2c    = self._discrete_colors(unique)
+        op     = self.opacity_slider.value() / 100.0
+        lbg    = self._theme["legend_bg"]
+        all_pids = []; all_eids = []; all_bar_pts = []; all_bar_lines = []
+        self._eid_val_map = {}
+
+        sh_cells = []
+        for eid, elem, pid, val in self._iter_elements(allowed_eids, nmap):
+            try:
+                if elem.type in ('CQUAD4', 'CQUAD8', 'CQUAD'):
+                    nids = elem.node_ids[:4]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([4] + [nmap[n] for n in nids])
+                elif elem.type in ('CTRIA3', 'CTRIA6'):
+                    nids = elem.node_ids[:3]
+                    if all(n in nmap for n in nids):
+                        sh_cells.append([3] + [nmap[n] for n in nids])
+            except Exception:
+                continue
+        if sh_cells:
+            m = pv.PolyData(pts, np.hstack(sh_cells))
+            actor = self.plotter.add_mesh(m, color='#cccccc', show_edges=True,
+                                        opacity=op * 0.5, pickable=False, show_scalar_bar=False)
+            self._viz_actors.append(actor)
+
+        for val in unique:
+            bp = []; bl = []
+            for eid, elem, pid, v in self._iter_elements(allowed_eids, nmap, eid_to_val=eid_to_val):
+                if v != val or elem.type != 'CBAR': continue
+                try:
+                    nids = elem.node_ids[:2]
+                    if not all(n in nmap for n in nids): continue
+                    p1 = self.bdf.nodes[nids[0]].get_position()
+                    p2 = self.bdf.nodes[nids[1]].get_position()
+                    gi = len(all_bar_pts); all_bar_pts.extend([p1, p2])
+                    all_bar_lines.append([2, gi, gi + 1])
+                    i  = len(bp); bp.extend([p1, p2]); bl.append([2, i, i + 1])
+                    all_pids.append(pid); all_eids.append(eid)
+                    self._eid_val_map[eid] = val
+                except Exception:
+                    continue
+            if bl:
+                bm    = pv.PolyData(np.array(bp), lines=np.hstack(bl))
+                actor = self.plotter.add_mesh(bm, color=v2c[val], 
+                                              line_width=self.linewidth_slider.value(),
+                                              render_lines_as_tubes=True, opacity=op,
+                                              pickable=True, show_scalar_bar=False)
+                self._viz_actors.append(actor)
+
+        bp = []; bl = []
+        for eid, elem, pid, v in self._iter_elements(allowed_eids, nmap, eid_to_val=eid_to_val):
+            if v is not None or elem.type != 'CBAR': continue
+            try:
+                nids = elem.node_ids[:2]
+                if not all(n in nmap for n in nids): continue
+                p1 = self.bdf.nodes[nids[0]].get_position()
+                p2 = self.bdf.nodes[nids[1]].get_position()
+                i  = len(bp); bp.extend([p1, p2]); bl.append([2, i, i + 1])
+            except Exception:
+                continue
+        if bl:
+            bm    = pv.PolyData(np.array(bp), lines=np.hstack(bl))
+            actor = self.plotter.add_mesh(bm, color='#aaaaaa', 
+                                          line_width=4,
+                                          #line_width=self.linewidth_slider.value(),
+                                          render_lines_as_tubes=True, opacity=op * 0.4)
+            self._viz_actors.append(actor)
+
+        if all_bar_pts:
+            self.current_mesh     = pv.PolyData(np.array(all_bar_pts), lines=np.hstack(all_bar_lines))
+            self.current_pid_data = np.array(all_pids)
+            self.current_eid_data = np.array(all_eids)
+        else:
+            self.log("No joint bar elements visible")
+
+        legend_entries = [[str(v), v2c[v]] for v in unique]
+        if bl:
+            legend_entries.append(['n/a', '#aaaaaa'])
+        try:
+            if legend_entries:
+                self.plotter.add_legend(
+                    labels=legend_entries, face='rectangle',
+                    size=(0.18, min(0.06 + len(legend_entries) * 0.035, 0.50)),
+                    loc='upper left', bcolor=None, border=False)
+        except Exception:
+            pass
+
+    # =========================================================================
+    # PID LABELS
+    # =========================================================================
+    def _toggle_labels(self):
+        if not self.plotter or self.current_mesh is None:
+            return
+        if self.pid_labels_actor is not None:
+            self.plotter.remove_actor(self.pid_labels_actor)
+            self.pid_labels_actor = None
+
+        if self.label_btn.isChecked() and self.current_pid_data is not None:
+            # only use currently visible elements
+            visible_eids = set(self._selected_eids())
+
+            pid_points = {}
+            for eid, elem in self.bdf.elements.items():
+                if eid not in visible_eids:        # ← filter
+                    continue
+                if not hasattr(elem, 'pid'):
+                    continue
+                pid = elem.pid
+                try:
+                    positions = [self.bdf.nodes[n].get_position()
+                                for n in elem.node_ids
+                                if n in self.bdf.nodes]
+                    if not positions:
+                        continue
+                    center = np.mean(positions, axis=0)
+                    pid_points.setdefault(pid, []).append(center)
+                except Exception:
+                    continue
+
+            centres = []
+            labels  = []
+            for pid, pts in pid_points.items():
+                centres.append(np.mean(pts, axis=0))
+                labels.append(str(int(pid)))
+
+            if centres:
+                self.pid_labels_actor = self.plotter.add_point_labels(
+                    centres, labels,
+                    font_size=16,
+                    text_color=self._theme["accent"],
+                    font_family='arial',
+                    shape_opacity=0.0,
+                    point_size=0,
+                    render_points_as_spheres=False,
+                    always_visible=False)
+
+        self.plotter.render()
+
+    def _toggle_edges(self):
+        show = self.edges_btn.isChecked()
+        for actor in self._viz_actors:
+            try:
+                actor.GetProperty().SetEdgeVisibility(1 if show else 0)
+            except Exception:
+                pass
+        if self.plotter:
+            self.plotter.render()
+
+    def _toggle_log(self):
+        if self.log_text.isVisible():
+            self.log_text.hide()
+            self.log_toggle_btn.setText("▲")
+            self.log_toggle_btn.setToolTip("Expand log")
+        else:
+            self.log_text.show()
+            self.log_toggle_btn.setText("▼")
+            self.log_toggle_btn.setToolTip("Collapse log")
+            
+    # =========================================================================
+    # RIGHT-CLICK PICK
+    # =========================================================================
+        
+    def _on_click(self, click_pos):
+        if self._picking_active or self.current_mesh is None or click_pos is None:
+            return
+        self._picking_active = True
+        try:
+            cell_id = self.current_mesh.find_closest_cell(click_pos)
+            if cell_id < 0:
+                return
+
+            center = self.current_mesh.cell_centers().points[cell_id]
+            if self._picked_actor is not None:
+                self.plotter.remove_actor(self._picked_actor)
+
+            bounds = self.current_mesh.bounds
+            size   = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4])
+            sphere = pv.Sphere(radius=size*0.01, center=center)
+            self._picked_actor = self.plotter.add_mesh(sphere, color='yellow', pickable=False)
+            self.plotter.render()
+
+            if np.linalg.norm(np.array(click_pos) - center) > size * 0.04:
+                return
+            if self.current_pid_data is None or cell_id >= len(self.current_pid_data):
+                return
+
+            pid       = int(self.current_pid_data[cell_id])
+            prop_type = (self.bdf.properties[pid].type
+                        if self.bdf and pid in self.bdf.properties else "?")
+
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers == Qt.ShiftModifier:
+                self._hidden_pids.add(pid)
+                self.log(f"Hidden PID {pid} — Shift+right-click to unhide all")
+                self._re_render()
+                return
+
+            col      = self._current_col
+            col_part = ""
+            if col not in ("Default View", "Property ID", "") and self._eid_val_map:
+                eid = int(self.current_eid_data[cell_id])
+                val = self._eid_val_map.get(eid)
+                if val is not None:
+                    col_part = f" - {col} : {val}"
+
+            eid  = int(self.current_eid_data[cell_id])
+            info_text = f"{prop_type}  PID:{pid}  EID:{eid}{col_part}"
+            self.pick_status.setText(info_text)
+            self.log(f"Right-clicked — {info_text}")
+
+        except Exception as e:
+            self.log(f"Click error: {e}")
+        finally:
+            QTimer.singleShot(300, self._unlock_picking)
+
+    def _unlock_picking(self):
+        self._picking_active = False
+
+
+    def _easter_egg(self):
+            import random
+            if not self.plotter:
+                return
+            self.log("🎉 triage mode activated...")
+            QApplication.processEvents()
+
+            loaders = [f for f in dir(pv.examples) 
+                    if not f.startswith('_') and callable(getattr(pv.examples, f))]
+            random.shuffle(loaders)
+
+            for name in loaders:
+                try:
+                    dataset = getattr(pv.examples, name)()
+                    if not hasattr(dataset, 'n_points') or dataset.n_points == 0:
+                        continue
+                    self.plotter.clear()
+                    self._viz_actors = []
+                    self.plotter.set_background(self._theme["vp_bg_hex"])
+                    self.plotter.add_axes(color=self._theme["axes_color"],
+                                        viewport=(0.0, 0.0, 0.12, 0.15))
+                    color = tuple(np.random.rand(3))
+                    self.plotter.add_mesh(dataset, show_edges=True,
+                                        edge_color=self._theme["axes_color"],
+                                        color=color, lighting=True)
+                    self.plotter.reset_camera()
+                    self.plotter.render()
+                    self.log(f"🎲 {name}")
+                    return
+                except Exception:
+                    continue
+                
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+def main():
+    print("MISGEN v5.1 — Structural Visualization Suite")
+    try:
+        app = QApplication(sys.argv)
+    except RuntimeError:
+        app = QApplication.instance()
+    app.setStyle("Fusion")
+    win = MISGEN_App()
+    win.showMaximized()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
